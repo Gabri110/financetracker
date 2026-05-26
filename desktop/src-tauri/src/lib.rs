@@ -90,6 +90,7 @@ pub fn run() {
             commands::accounts::get_accounts,
             commands::accounts::add_account,
             commands::accounts::update_account,
+            commands::accounts::adjust_account_balance,
             commands::accounts::delete_account,
             // Transactions
             commands::transactions::get_transactions,

@@ -13,6 +13,8 @@ export const addAccount = (name, accountType, balance, currency) =>
   invoke("add_account", { name, accountType, balance, currency });
 export const updateAccount = (id, name, accountType, balance, currency) =>
   invoke("update_account", { id, name, accountType, balance, currency });
+export const adjustAccountBalance = (id, targetBalance) =>
+  invoke("adjust_account_balance", { id, targetBalance });
 export const deleteAccount = (id) => invoke("delete_account", { id });
 
 // Transactions

@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { getAccounts, addAccount, updateAccount, deleteAccount } from "../api/tauri";
+import { getAccounts, addAccount, updateAccount, adjustAccountBalance, deleteAccount } from "../api/tauri";
 import Alert from "../components/Alert";
 
 const ACCOUNT_TYPES = ["checking", "savings", "credit", "cash", "investment", "other"];
@@ -10,6 +10,7 @@ const fmt = (n, currency = "USD") =>
   new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 const empty = { name: "", account_type: "checking", balance: 0, currency: "USD" };
+const emptyAdjustment = { enabled: false, targetBalance: "" };
 
 export default function Accounts() {
   const { t } = useTranslation();
@@ -19,14 +20,21 @@ export default function Accounts() {
   const [showForm, setShowForm] = useState(false);
   const [alert, setAlert] = useState({ type: "", msg: "" });
   const [deleting, setDeleting] = useState(null);
+  const [adjustment, setAdjustment] = useState(emptyAdjustment);
 
   const load = () => getAccounts().then(setAccounts).catch((e) => setAlert({ type: "danger", msg: String(e) }));
   useEffect(() => { load(); }, []);
 
-  const openAdd = () => { setForm(empty); setEditing(null); setShowForm(true); };
+  const openAdd = () => {
+    setForm(empty);
+    setEditing(null);
+    setAdjustment(emptyAdjustment);
+    setShowForm(true);
+  };
   const openEdit = (a) => {
     setForm({ name: a.name, account_type: a.account_type, balance: a.balance, currency: a.currency });
     setEditing(a.id);
+    setAdjustment({ enabled: false, targetBalance: String(a.balance) });
     setShowForm(true);
   };
 
@@ -35,12 +43,20 @@ export default function Accounts() {
     try {
       if (editing) {
         await updateAccount(editing, form.name, form.account_type, Number(form.balance), form.currency);
+        if (adjustment.enabled) {
+          const targetBalance = Number(adjustment.targetBalance);
+          if (Number.isNaN(targetBalance)) {
+            throw new Error("Target balance must be a valid number");
+          }
+          await adjustAccountBalance(editing, targetBalance);
+        }
         setAlert({ type: "success", msg: t("accounts.accountUpdated") });
       } else {
         await addAccount(form.name, form.account_type, Number(form.balance), form.currency);
         setAlert({ type: "success", msg: t("accounts.accountAdded") });
       }
       setShowForm(false);
+      setAdjustment(emptyAdjustment);
       load();
     } catch (e) {
       setAlert({ type: "danger", msg: String(e) });
@@ -98,9 +114,46 @@ export default function Accounts() {
                 <div className="col-md-3">
                   <label className="form-label">{t("accounts.balance")}</label>
                   <input className="form-control" type="number" step="0.01" value={form.balance}
+                    disabled={Boolean(editing)}
                     onChange={(e) => setForm({ ...form, balance: e.target.value })} />
+                  {editing && (
+                    <small className="text-muted">Opening balance is locked after account creation.</small>
+                  )}
                 </div>
               </div>
+              {editing && (
+                <div className="mt-3 p-3 rounded border bg-light-subtle">
+                  <div className="d-flex justify-content-between align-items-center mb-2">
+                    <span className="fw-semibold">Current balance</span>
+                    <span className="fw-bold">{fmt(Number(form.balance) || 0, form.currency)}</span>
+                  </div>
+                  <div className="form-check mb-2">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id="changeCurrentBalance"
+                      checked={adjustment.enabled}
+                      onChange={(e) => setAdjustment({ ...adjustment, enabled: e.target.checked })}
+                    />
+                    <label className="form-check-label" htmlFor="changeCurrentBalance">
+                      Change current balance
+                    </label>
+                  </div>
+                  {adjustment.enabled && (
+                    <div>
+                      <label className="form-label">Target current balance</label>
+                      <input
+                        className="form-control"
+                        type="number"
+                        step="0.01"
+                        value={adjustment.targetBalance}
+                        onChange={(e) => setAdjustment({ ...adjustment, targetBalance: e.target.value })}
+                      />
+                      <small className="text-muted">Creates one Balance Adjustment transaction on the opening date.</small>
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="mt-3 d-flex gap-2">
                 <button className="btn btn-primary" type="submit">{t("common.save")}</button>
                 <button className="btn btn-outline-secondary" type="button" onClick={() => setShowForm(false)}>{t("common.cancel")}</button>

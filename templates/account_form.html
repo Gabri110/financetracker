@@ -57,6 +57,41 @@
                         </select>
                     </div>
 
+                    {% if account %}
+                    <div class="card bg-light border-0 mb-4">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span class="fw-semibold">Current Balance</span>
+                                <span class="fw-bold {% if current_balance >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                    {{ account.currency }} {{ "{:,.2f}".format(current_balance) }}
+                                </span>
+                            </div>
+
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="change_current_balance" name="change_current_balance"
+                                       {% if request.form.get('change_current_balance') == 'on' %}checked{% endif %}>
+                                <label class="form-check-label" for="change_current_balance">
+                                    Change current balance
+                                </label>
+                            </div>
+
+                            <div id="target-balance-container" class="mt-3" style="display: none;">
+                                <label for="target_current_balance" class="form-label">Target current balance</label>
+                                <div class="input-group">
+                                    <span class="input-group-text">{{ account.currency }}</span>
+                                    <input type="number" class="form-control" id="target_current_balance" name="target_current_balance"
+                                           step="0.01"
+                                           value="{{ request.form.get('target_current_balance', "{:0.2f}".format(current_balance)) }}"
+                                           placeholder="0.00">
+                                </div>
+                                <div class="form-text">
+                                    This creates one "Balance Adjustment" transaction dated to account opening date.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+
                     <div class="d-flex justify-content-between">
                         <a href="{{ url_for('accounts') }}" class="btn btn-outline-secondary">
                             <i class="bi bi-arrow-left"></i> Cancel
@@ -70,4 +105,29 @@
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+{% if account %}
+<script>
+    (function () {
+        const checkbox = document.getElementById('change_current_balance');
+        const container = document.getElementById('target-balance-container');
+        const input = document.getElementById('target_current_balance');
+
+        if (!checkbox || !container || !input) {
+            return;
+        }
+
+        function syncState() {
+            const enabled = checkbox.checked;
+            container.style.display = enabled ? 'block' : 'none';
+            input.required = enabled;
+        }
+
+        checkbox.addEventListener('change', syncState);
+        syncState();
+    })();
+</script>
+{% endif %}
 {% endblock %}

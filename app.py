@@ -208,6 +208,58 @@ def auto_categorize_transaction(user_id, description, payee):
     return None
 
 
+def get_account_current_balance(db, user_id, account_id):
+    """Compute current balance from account transactions."""
+    row = db.execute('''
+        SELECT COALESCE(SUM(CASE WHEN transaction_type = 'income' THEN amount
+                                 WHEN transaction_type = 'expense' THEN -amount
+                                 ELSE 0 END), 0) AS current_balance
+        FROM transactions
+        WHERE user_id = ? AND account_id = ?
+    ''', (user_id, account_id)).fetchone()
+    return float(row['current_balance']) if row else 0.0
+
+
+def get_account_opening_date(account):
+    """Use account creation date for balance adjustment entries."""
+    created_at = (account['created_at'] or '').strip()
+    if not created_at:
+        return datetime.now().date()
+
+    # SQLite timestamps are usually YYYY-MM-DD HH:MM:SS.
+    date_part = created_at.split(' ')[0]
+    try:
+        return datetime.strptime(date_part, '%Y-%m-%d').date()
+    except ValueError:
+        return datetime.now().date()
+
+
+def apply_target_balance_adjustment(db, user_id, account, target_balance, current_balance):
+    """Insert one synthetic transaction to bridge current and target balance."""
+    rounded_target = round(float(target_balance), 2)
+    rounded_current = round(float(current_balance), 2)
+    delta = round(rounded_target - rounded_current, 2)
+
+    if delta == 0:
+        return 0.0
+
+    transaction_type = 'income' if delta > 0 else 'expense'
+    db.execute(
+        '''INSERT INTO transactions (user_id, account_id, transaction_type, amount, description, payee, date)
+           VALUES (?, ?, ?, ?, ?, ?, ?)''',
+        (
+            user_id,
+            account['id'],
+            transaction_type,
+            abs(delta),
+            'Balance Adjustment',
+            'System Adjustment',
+            get_account_opening_date(account),
+        )
+    )
+    return delta
+
+
 # User class for Flask-Login
 class User(UserMixin):
     def __init__(self, id, username, email):
@@ -454,24 +506,54 @@ def edit_account(account_id):
         flash('Account not found.', 'danger')
         return redirect(url_for('accounts'))
 
+    current_balance = get_account_current_balance(db, current_user.id, account_id)
+
     if request.method == 'POST':
         name = request.form['name'].strip()
         account_type = request.form['account_type']
         currency = request.form.get('currency', 'USD')
+        change_current_balance = request.form.get('change_current_balance') == 'on'
+        target_balance_raw = request.form.get('target_current_balance', '').strip()
 
         if not name:
             flash('Account name is required.', 'danger')
-            return render_template('account_form.html', account=account)
+            return render_template('account_form.html', account=account, current_balance=current_balance)
+
+        adjustment_delta = 0.0
+        if change_current_balance:
+            if not target_balance_raw:
+                flash('Target current balance is required when balance change is enabled.', 'danger')
+                return render_template('account_form.html', account=account, current_balance=current_balance)
+            try:
+                target_balance = round(float(target_balance_raw), 2)
+            except ValueError:
+                flash('Target current balance must be a valid number.', 'danger')
+                return render_template('account_form.html', account=account, current_balance=current_balance)
 
         db.execute(
             'UPDATE accounts SET name = ?, account_type = ?, currency = ? WHERE id = ? AND user_id = ?',
             (name, account_type, currency, account_id, current_user.id)
         )
+
+        if change_current_balance:
+            adjustment_delta = apply_target_balance_adjustment(
+                db,
+                current_user.id,
+                account,
+                target_balance,
+                current_balance,
+            )
+
         db.commit()
-        flash('Account updated successfully!', 'success')
+
+        if change_current_balance and adjustment_delta != 0:
+            flash(f'Account updated and balance adjusted by {adjustment_delta:.2f}.', 'success')
+        else:
+            flash('Account updated successfully!', 'success')
+
         return redirect(url_for('accounts'))
 
-    return render_template('account_form.html', account=account)
+    return render_template('account_form.html', account=account, current_balance=current_balance)
 
 
 @app.route('/accounts/<int:account_id>/delete', methods=['POST'])
