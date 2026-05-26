@@ -136,9 +136,11 @@ financetracker/
 3. Select the account to import into
 4. Upload your CSV file
 5. The importer auto-detects:
-   - Date format (DD/MM/YYYY or YYYY-MM-DD)
+   - Expected columns: `ID_TRANSACTION,DATE,AMOUNT,CATEGORY,DESCRIPTION`
+   - Date format (YYYY-MM-DD)
    - Number format (1,234.56 or 1.234,56)
    - Delimiter (comma, semicolon, tab)
+   - If `ID_TRANSACTION` is present and already imported, the new row replaces the previous transaction data
 
 ### Setting Up Email Forwarding
 

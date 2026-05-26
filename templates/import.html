@@ -23,7 +23,7 @@
                         <label for="file" class="form-label">CSV File *</label>
                         <input type="file" class="form-control" id="file" name="file" accept=".csv" required>
                         <div class="form-text">
-                            Expected format: FECHA OPERACIÓN, FECHA VALOR, CATEGORIA, CONCEPTO, IMPORTE EUR
+                            Expected format: ID_TRANSACTION, DATE, AMOUNT, CATEGORY, DESCRIPTION
                         </div>
                     </div>
 
@@ -76,11 +76,13 @@
                         <h6><i class="bi bi-info-circle"></i> Import Notes</h6>
                         <ul class="mb-0 small">
                             <li>Supports comma, semicolon, and tab delimiters</li>
-                            <li>Date formats: DD/MM/YYYY or YYYY-MM-DD</li>
+                            <li>Date format: YYYY-MM-DD</li>
                             <li>European number format supported (1.234,56)</li>
                             <li>Negative amounts are imported as expenses</li>
                             <li>Positive amounts are imported as income</li>
+                            <li>Rows with same ID_TRANSACTION replace previous imported data</li>
                             <li>Categories are auto-matched when possible</li>
+                            <li>Transfer categories (for example, Transferencia interna or Ahorros) are imported as transfer type</li>
                         </ul>
                     </div>
 
@@ -107,27 +109,27 @@
                     <table class="table table-sm small">
                         <thead>
                             <tr>
-                                <th>FECHA OPERACIÓN</th>
-                                <th>FECHA VALOR</th>
-                                <th>CATEGORIA</th>
-                                <th>CONCEPTO</th>
-                                <th>IMPORTE EUR</th>
+                                <th>ID_TRANSACTION</th>
+                                <th>DATE</th>
+                                <th>AMOUNT</th>
+                                <th>CATEGORY</th>
+                                <th>DESCRIPTION</th>
                             </tr>
                         </thead>
                         <tbody>
                             <tr>
-                                <td>08/01/2026</td>
-                                <td>08/01/2026</td>
+                                <td>txn_0001</td>
+                                <td>2026-01-08</td>
+                                <td>-45.50</td>
                                 <td>Groceries</td>
                                 <td>Supermarket purchase</td>
-                                <td>-45,50</td>
                             </tr>
                             <tr>
-                                <td>08/01/2026</td>
-                                <td>08/01/2026</td>
+                                <td>txn_0002</td>
+                                <td>2026-01-08</td>
+                                <td>3500.00</td>
                                 <td>Salary</td>
                                 <td>Monthly salary</td>
-                                <td>3.500,00</td>
                             </tr>
                         </tbody>
                     </table>

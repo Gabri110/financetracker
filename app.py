@@ -154,6 +154,14 @@ def init_db():
             FOREIGN KEY (transaction_id) REFERENCES transactions (id)
         );
     ''')
+
+    # Add optional external transaction reference used by CSV imports.
+    transaction_columns = {
+        row['name'] for row in db.execute('PRAGMA table_info(transactions)').fetchall()
+    }
+    if 'id_transaction' not in transaction_columns:
+        db.execute('ALTER TABLE transactions ADD COLUMN id_transaction TEXT')
+
     db.commit()
 
 
@@ -206,6 +214,24 @@ def auto_categorize_transaction(user_id, description, payee):
                 return rule['category_id']
 
     return None
+
+
+def is_transfer_like_category(category_text):
+    """Return True when CSV category text clearly indicates a transfer."""
+    if not category_text:
+        return False
+
+    normalized = category_text.strip().lower()
+    transfer_tokens = [
+        'transfer',
+        'transferencia',
+        'transferencia interna',
+        'traspaso',
+        'ahorros',
+        'savings',
+        'internal transfer',
+    ]
+    return any(token in normalized for token in transfer_tokens)
 
 
 def get_account_current_balance(db, user_id, account_id):
@@ -730,6 +756,7 @@ def import_csv():
                          (current_user.id,)).fetchall()
     categories = db.execute('SELECT * FROM categories WHERE user_id = ? ORDER BY category_type, name',
                            (current_user.id,)).fetchall()
+    categories_by_id = {str(cat['id']): cat for cat in categories}
 
     if request.method == 'POST':
         if 'file' not in request.files:
@@ -770,12 +797,21 @@ def import_csv():
             reader = csv.reader(csv_file, delimiter=delimiter)
 
             imported_count = 0
+            updated_count = 0
             skipped_count = 0
             errors = []
+            expected_headers = ['ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION']
 
             for row_num, row in enumerate(reader, 1):
                 # Skip header row if requested
                 if skip_first_row and row_num == 1:
+                    normalized_header = [col.strip().lstrip('\ufeff').upper() for col in row[:5]]
+                    if len(row) < 5 or normalized_header != expected_headers:
+                        flash(
+                            'Invalid CSV header. Expected: ID_TRANSACTION,DATE,AMOUNT,CATEGORY,DESCRIPTION',
+                            'danger'
+                        )
+                        return redirect(url_for('import_csv'))
                     continue
 
                 if len(row) < 5:
@@ -783,22 +819,20 @@ def import_csv():
                     continue
 
                 try:
-                    # Parse CSV columns: FECHA OPERACIÓN, FECHA VALOR, CATEGORIA, CONCEPTO, IMPORTE EUR
-                    date_str = row[0].strip()
-                    category_csv = row[2].strip()
-                    description = row[3].strip()
-                    amount_str = row[4].strip()
+                    # Parse CSV columns: ID_TRANSACTION, DATE, AMOUNT, CATEGORY, DESCRIPTION
+                    id_transaction = row[0].strip() or None
+                    date_str = row[1].strip()
+                    amount_str = row[2].strip()
+                    category_csv = row[3].strip()
+                    description = row[4].strip()
 
-                    # Parse date (DD/MM/YYYY format)
+                    # Parse date (YYYY-MM-DD format)
                     try:
-                        parsed_date = datetime.strptime(date_str, '%d/%m/%Y').date()
+                        parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                     except ValueError:
-                        try:
-                            parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                        except ValueError:
-                            errors.append(f"Row {row_num}: Invalid date format '{date_str}'")
-                            skipped_count += 1
-                            continue
+                        errors.append(f"Row {row_num}: Invalid date format '{date_str}'. Expected YYYY-MM-DD")
+                        skipped_count += 1
+                        continue
 
                     # Parse amount (handle various number formats)
                     amount_str = amount_str.replace('"', '').replace(' ', '')
@@ -847,13 +881,83 @@ def import_csv():
                     if not matched_category_id:
                         matched_category_id = default_category_id
 
-                    # Insert transaction
-                    db.execute(
-                        '''INSERT INTO transactions (user_id, account_id, category_id, transaction_type, amount, description, payee, date)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                        (current_user.id, account_id, matched_category_id, trans_type, amount, description, category_csv, parsed_date)
-                    )
-                    imported_count += 1
+                    matched_category = categories_by_id.get(str(matched_category_id)) if matched_category_id else None
+
+                    # Transfer categories should be imported as transfer regardless of amount sign.
+                    if (matched_category and matched_category['category_type'] == 'transfer') or is_transfer_like_category(category_csv):
+                        trans_type = 'transfer'
+
+                    # Upsert by id_transaction when provided: newest import replaces existing data.
+                    if id_transaction:
+                        existing_matches = db.execute(
+                            '''SELECT id FROM transactions
+                               WHERE user_id = ? AND account_id = ? AND id_transaction = ?
+                               ORDER BY id DESC''',
+                            (current_user.id, account_id, id_transaction)
+                        ).fetchall()
+
+                        if existing_matches:
+                            keep_id = existing_matches[0]['id']
+                            db.execute(
+                                '''UPDATE transactions
+                                   SET category_id = ?, transaction_type = ?, amount = ?,
+                                       description = ?, payee = ?, date = ?
+                                   WHERE id = ? AND user_id = ?''',
+                                (
+                                    matched_category_id,
+                                    trans_type,
+                                    amount,
+                                    description,
+                                    category_csv,
+                                    parsed_date,
+                                    keep_id,
+                                    current_user.id,
+                                )
+                            )
+
+                            # Clean up any older duplicates for the same id_transaction.
+                            for duplicate_row in existing_matches[1:]:
+                                db.execute(
+                                    'DELETE FROM transactions WHERE id = ? AND user_id = ?',
+                                    (duplicate_row['id'], current_user.id)
+                                )
+                            updated_count += 1
+                        else:
+                            db.execute(
+                                '''INSERT INTO transactions
+                                   (user_id, account_id, category_id, transaction_type, amount,
+                                    description, payee, date, id_transaction)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                (
+                                    current_user.id,
+                                    account_id,
+                                    matched_category_id,
+                                    trans_type,
+                                    amount,
+                                    description,
+                                    category_csv,
+                                    parsed_date,
+                                    id_transaction,
+                                )
+                            )
+                            imported_count += 1
+                    else:
+                        db.execute(
+                            '''INSERT INTO transactions
+                               (user_id, account_id, category_id, transaction_type, amount, description, payee, date)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (
+                                current_user.id,
+                                account_id,
+                                matched_category_id,
+                                trans_type,
+                                amount,
+                                description,
+                                category_csv,
+                                parsed_date,
+                            )
+                        )
+                        imported_count += 1
 
                 except Exception as e:
                     errors.append(f"Row {row_num}: {str(e)}")
@@ -862,8 +966,11 @@ def import_csv():
 
             db.commit()
 
-            if imported_count > 0:
-                flash(f'Successfully imported {imported_count} transactions.', 'success')
+            if imported_count > 0 or updated_count > 0:
+                flash(
+                    f'Successfully imported {imported_count} new transactions and updated {updated_count} existing transactions.',
+                    'success'
+                )
             if skipped_count > 0:
                 flash(f'Skipped {skipped_count} rows.', 'warning')
             if errors and len(errors) <= 5:
