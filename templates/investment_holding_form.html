@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Edit Holding' if holding else 'Add Holding' }} - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1><i class="bi bi-grid"></i> {{ 'Edit Holding' if holding else 'Add Holding' }}</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-10 col-lg-8">
+        <div class="card">
+            <div class="card-body p-4">
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="account_id" class="form-label">Investment Account *</label>
+                            <select class="form-select" id="account_id" name="account_id" required>
+                                <option value="">Select account...</option>
+                                {% for account in investment_accounts %}
+                                <option value="{{ account.id }}" {% if holding and holding.account_id == account.id %}selected{% endif %}>{{ account.name }} ({{ account.currency }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="asset_class" class="form-label">Asset Class *</label>
+                            <select class="form-select" id="asset_class" name="asset_class" required>
+                                <option value="">Select class...</option>
+                                {% for asset_class in asset_classes %}
+                                <option value="{{ asset_class }}" {% if holding and holding.asset_class == asset_class %}selected{% endif %}>{{ asset_class }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-7 mb-3">
+                            <label for="asset_name" class="form-label">Asset Name *</label>
+                            <input type="text" class="form-control" id="asset_name" name="asset_name" required
+                                   value="{{ holding.asset_name if holding else '' }}" placeholder="e.g., Vanguard FTSE All-World ETF">
+                        </div>
+                        <div class="col-md-5 mb-3">
+                            <label for="ticker" class="form-label">Ticker</label>
+                            <input type="text" class="form-control" id="ticker" name="ticker"
+                                   value="{{ holding.ticker if holding else '' }}" placeholder="e.g., VWCE">
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label for="quantity" class="form-label" id="quantity-label">Quantity *</label>
+                            <input type="number" class="form-control" id="quantity" name="quantity" step="0.00000001" min="0" required
+                                   value="{{ holding.quantity if holding else 0 }}">
+                            <div class="form-text" id="quantity-help"></div>
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="avg_cost" class="form-label" id="avg-cost-label">Average Cost *</label>
+                            <input type="number" class="form-control" id="avg_cost" name="avg_cost" step="0.00000001" min="0" required
+                                   value="{{ holding.avg_cost if holding else 0 }}">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="current_price" class="form-label" id="current-price-label">Current Price *</label>
+                            <input type="number" class="form-control" id="current_price" name="current_price" step="0.00000001" min="0" required
+                                   value="{{ holding.current_price if holding else 0 }}">
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="currency" class="form-label">Currency *</label>
+                        <select class="form-select" id="currency" name="currency" required>
+                            {% for c in ['EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'MXN'] %}
+                            <option value="{{ c }}" {% if (holding and holding.currency == c) or (not holding and c == 'EUR') %}selected{% endif %}>{{ c }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('investments') }}" class="btn btn-outline-secondary">
+                            <i class="bi bi-arrow-left"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-lg"></i> {{ 'Save Changes' if holding else 'Add Holding' }}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+    const assetClass = document.getElementById('asset_class');
+    const quantityInput = document.getElementById('quantity');
+    const quantityLabel = document.getElementById('quantity-label');
+    const quantityHelp = document.getElementById('quantity-help');
+    const avgCostLabel = document.getElementById('avg-cost-label');
+    const currentPriceLabel = document.getElementById('current-price-label');
+
+    function syncMintosMode() {
+        const isMintos = assetClass.value === 'Mintos Lending';
+        if (isMintos) {
+            quantityInput.value = '1';
+            quantityInput.readOnly = true;
+            quantityInput.classList.add('bg-light');
+            quantityLabel.textContent = 'Units (fixed)';
+            quantityHelp.textContent = 'Mintos is treated as account money. Units stay fixed at 1.';
+            avgCostLabel.textContent = 'Money Invested *';
+            currentPriceLabel.textContent = 'Current Account Value *';
+            return;
+        }
+
+        quantityInput.readOnly = false;
+        quantityInput.classList.remove('bg-light');
+        quantityLabel.textContent = 'Quantity *';
+        quantityHelp.textContent = '';
+        avgCostLabel.textContent = 'Average Cost *';
+        currentPriceLabel.textContent = 'Current Price *';
+    }
+
+    assetClass.addEventListener('change', syncMintosMode);
+    syncMintosMode();
+})();
+</script>
+{% endblock %}

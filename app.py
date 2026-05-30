@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import zipfile
 import importlib
+from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
@@ -30,6 +31,16 @@ app.config['REGISTRATION_ENABLED'] = os.environ.get('REGISTRATION_ENABLED', 'tru
 DEFAULT_BASE_CURRENCY = 'EUR'
 ECB_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
 SUPPORTED_CURRENCIES = {'EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN'}
+INVESTMENT_ASSET_CLASSES = (
+    'ETF',
+    'Fixed Income Fund',
+    'Private Equity Fund',
+    'Mintos Lending',
+)
+INVESTMENT_INCOME_PROFILES = ('fixed', 'variable')
+DECIMAL_QUANTITY_PLACES = Decimal('0.00000001')
+DECIMAL_MONEY_PLACES = Decimal('0.00000001')
+FRACTIONAL_TOLERANCE = Decimal('0.00000001')
 SYMBOL_BY_CURRENCY = {
     'EUR': '€',
     'USD': '$',
@@ -201,6 +212,68 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (from_currency, to_currency)
         );
+
+        CREATE TABLE IF NOT EXISTS investment_holdings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            asset_name TEXT NOT NULL,
+            ticker TEXT,
+            asset_class TEXT NOT NULL,
+            currency TEXT DEFAULT 'EUR',
+            quantity REAL NOT NULL DEFAULT 0,
+            avg_cost REAL NOT NULL DEFAULT 0,
+            current_price REAL NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id),
+            FOREIGN KEY (account_id) REFERENCES accounts (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS investment_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            holding_id INTEGER,
+            operation_type TEXT NOT NULL,
+            quantity REAL,
+            price_per_unit REAL,
+            amount REAL NOT NULL,
+            currency TEXT DEFAULT 'USD',
+            is_reinvested INTEGER DEFAULT 0,
+            realized_gain REAL,
+            note TEXT,
+            operation_date DATE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id),
+            FOREIGN KEY (account_id) REFERENCES accounts (id),
+            FOREIGN KEY (holding_id) REFERENCES investment_holdings (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS investment_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            snapshot_date DATE NOT NULL,
+            total_value REAL NOT NULL,
+            currency TEXT DEFAULT 'USD',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS investment_valuations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            holding_id INTEGER NOT NULL,
+            valuation_date DATE NOT NULL,
+            total_value REAL NOT NULL,
+            currency TEXT DEFAULT 'USD',
+            return_pct REAL,
+            return_amount REAL,
+            note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id),
+            FOREIGN KEY (holding_id) REFERENCES investment_holdings (id)
+        );
     ''')
 
     # Add optional external transaction reference used by CSV imports.
@@ -215,6 +288,14 @@ def init_db():
     }
     if 'base_currency' not in user_columns:
         db.execute(f"ALTER TABLE users ADD COLUMN base_currency TEXT DEFAULT '{DEFAULT_BASE_CURRENCY}'")
+
+    account_columns = {
+        row['name'] for row in db.execute('PRAGMA table_info(accounts)').fetchall()
+    }
+    if 'income_profile' not in account_columns:
+        db.execute("ALTER TABLE accounts ADD COLUMN income_profile TEXT")
+    if 'is_investment_dashboard' not in account_columns:
+        db.execute('ALTER TABLE accounts ADD COLUMN is_investment_dashboard INTEGER DEFAULT 0')
 
     db.commit()
 
@@ -1007,6 +1088,186 @@ def get_account_current_balance(db, user_id, account_id):
     return float(row['current_balance']) if row else 0.0
 
 
+def parse_decimal_field(raw_value, field_name, quantize_to=None):
+    try:
+        value = Decimal(str(raw_value if raw_value is not None else '0').strip() or '0')
+    except (InvalidOperation, ValueError):
+        raise ValueError(f'{field_name} must be numeric.')
+
+    if quantize_to is not None:
+        value = value.quantize(quantize_to)
+    return value
+
+
+def get_holding_value_components(holding):
+    if holding['asset_class'] == 'Mintos Lending':
+        current_value = Decimal(str(holding['current_price'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+        invested_value = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+        return current_value, invested_value
+
+    quantity = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
+    current_price = Decimal(str(holding['current_price'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    avg_cost = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    current_value = (quantity * current_price).quantize(DECIMAL_MONEY_PLACES)
+    invested_value = (quantity * avg_cost).quantize(DECIMAL_MONEY_PLACES)
+    return current_value, invested_value
+
+
+def get_holding_base_value(db, user_id, holding, as_of_date=None):
+    params = [user_id, holding['id']]
+    date_filter = ''
+    if as_of_date:
+        date_filter = 'AND valuation_date <= ?'
+        params.append(as_of_date)
+
+    latest = db.execute(
+        f'''SELECT total_value
+            FROM investment_valuations
+            WHERE user_id = ? AND holding_id = ? {date_filter}
+            ORDER BY valuation_date DESC, id DESC
+            LIMIT 1''',
+        tuple(params),
+    ).fetchone()
+
+    if latest:
+        return Decimal(str(latest['total_value'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+
+    current_value, _ = get_holding_value_components(holding)
+    return current_value
+
+
+def get_investment_accounts(db, user_id):
+    return db.execute(
+        '''SELECT *
+           FROM accounts
+           WHERE user_id = ?
+             AND account_type = 'investment'
+             AND COALESCE(is_investment_dashboard, 0) = 1
+           ORDER BY name''',
+        (user_id,),
+    ).fetchall()
+
+
+def build_investment_dashboard_data(db, user_id, base_currency):
+    holdings = db.execute(
+        '''SELECT h.*, a.name AS account_name, a.income_profile AS account_income_profile, a.currency AS account_currency
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.user_id = ?
+             AND a.user_id = ?
+             AND a.account_type = 'investment'
+             AND COALESCE(a.is_investment_dashboard, 0) = 1
+           ORDER BY h.asset_name''',
+        (user_id, user_id),
+    ).fetchall()
+
+    total_portfolio_value = 0.0
+    invested_capital = 0.0
+    allocation_map = defaultdict(float)
+    normalized_holdings = []
+
+    for row in holdings:
+        current_value_dec, cost_basis_dec = get_holding_value_components(row)
+        current_value = float(current_value_dec)
+        cost_basis = float(cost_basis_dec)
+        converted_current = convert_amount(db, current_value, row['currency'], base_currency)
+        converted_cost = convert_amount(db, cost_basis, row['currency'], base_currency)
+
+        total_portfolio_value += converted_current
+        invested_capital += converted_cost
+        allocation_map[row['asset_class']] += converted_current
+
+        item = dict(row)
+        item['current_value'] = current_value
+        item['cost_basis'] = cost_basis
+        item['unrealized_gain'] = current_value - cost_basis
+        normalized_holdings.append(item)
+
+    unrealized_gain = total_portfolio_value - invested_capital
+
+    realized_row = db.execute(
+        '''SELECT COALESCE(SUM(realized_gain), 0) AS realized_gain
+           FROM investment_operations
+           WHERE user_id = ? AND operation_type = 'sell' ''',
+        (user_id,),
+    ).fetchone()
+    realized_gain = float(realized_row['realized_gain']) if realized_row else 0.0
+
+    current_month = datetime.now().strftime('%Y-%m')
+    current_year = datetime.now().strftime('%Y')
+    dividend_rows = db.execute(
+        '''SELECT amount, currency, operation_date
+           FROM investment_operations
+           WHERE user_id = ? AND operation_type = 'dividend' ''',
+        (user_id,),
+    ).fetchall()
+
+    dividend_mtd = 0.0
+    dividend_ytd = 0.0
+    for row in dividend_rows:
+        converted = convert_amount(db, row['amount'], row['currency'], base_currency)
+        row_month = (row['operation_date'] or '')[:7]
+        row_year = (row['operation_date'] or '')[:4]
+        if row_month == current_month:
+            dividend_mtd += converted
+        if row_year == current_year:
+            dividend_ytd += converted
+
+    allocation_data = sorted(
+        (
+            {
+                'asset_class': key,
+                'total': value,
+            }
+            for key, value in allocation_map.items()
+            if value > 0
+        ),
+        key=lambda item: item['total'],
+        reverse=True,
+    )
+
+    snapshot_rows = db.execute(
+        '''SELECT snapshot_date, total_value, currency
+           FROM investment_snapshots
+           WHERE user_id = ?
+           ORDER BY snapshot_date ASC''',
+        (user_id,),
+    ).fetchall()
+
+    performance_points = []
+    for row in snapshot_rows:
+        performance_points.append(
+            {
+                'date': row['snapshot_date'],
+                'value': convert_amount(db, row['total_value'], row['currency'], base_currency),
+            }
+        )
+
+    recent_operations = db.execute(
+        '''SELECT o.*, h.asset_name, a.name AS account_name
+           FROM investment_operations o
+           LEFT JOIN investment_holdings h ON h.id = o.holding_id
+           JOIN accounts a ON a.id = o.account_id
+           WHERE o.user_id = ?
+           ORDER BY o.operation_date DESC, o.id DESC
+           LIMIT 15''',
+        (user_id,),
+    ).fetchall()
+
+    return {
+        'holdings': normalized_holdings,
+        'allocation_data': allocation_data,
+        'performance_points': performance_points,
+        'recent_operations': recent_operations,
+        'total_portfolio_value': total_portfolio_value,
+        'invested_capital': invested_capital,
+        'unrealized_gain': unrealized_gain,
+        'realized_gain': realized_gain,
+        'dividend_mtd': dividend_mtd,
+        'dividend_ytd': dividend_ytd,
+    }
+
+
 def get_account_opening_date(account):
     """Use account creation date for balance adjustment entries."""
     created_at = (account['created_at'] or '').strip()
@@ -1391,6 +1652,790 @@ def delete_account(account_id):
     db.commit()
     flash('Account deleted.', 'info')
     return redirect(url_for('accounts'))
+
+
+@app.route('/investments')
+@login_required
+def investments():
+    db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
+
+    investment_accounts = get_investment_accounts(db, current_user.id)
+    dashboard_data = build_investment_dashboard_data(db, current_user.id, base_currency)
+
+    return render_template(
+        'investments.html',
+        investment_accounts=investment_accounts,
+        base_currency=base_currency,
+        asset_classes=INVESTMENT_ASSET_CLASSES,
+        today=datetime.now().strftime('%Y-%m-%d'),
+        **dashboard_data,
+    )
+
+
+@app.route('/investments/accounts/add', methods=['GET', 'POST'])
+@login_required
+def add_investment_account():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        currency = normalize_currency(request.form.get('currency', 'EUR'))
+        income_profile = (request.form.get('income_profile', '') or '').strip().lower()
+
+        if not name:
+            flash('Investment account name is required.', 'danger')
+            return render_template('investment_account_form.html', account=None, profiles=INVESTMENT_INCOME_PROFILES)
+        if currency not in SUPPORTED_CURRENCIES:
+            flash('Unsupported currency.', 'danger')
+            return render_template('investment_account_form.html', account=None, profiles=INVESTMENT_INCOME_PROFILES)
+        if income_profile not in INVESTMENT_INCOME_PROFILES:
+            flash('Please select fixed or variable income profile.', 'danger')
+            return render_template('investment_account_form.html', account=None, profiles=INVESTMENT_INCOME_PROFILES)
+
+        db = get_db()
+        db.execute(
+            '''INSERT INTO accounts (user_id, name, account_type, balance, currency, income_profile, is_investment_dashboard)
+               VALUES (?, ?, 'investment', 0, ?, ?, 1)''',
+            (current_user.id, name, currency, income_profile),
+        )
+        db.commit()
+        flash('Investment account created successfully.', 'success')
+        return redirect(url_for('investments'))
+
+    return render_template('investment_account_form.html', account=None, profiles=INVESTMENT_INCOME_PROFILES)
+
+
+@app.route('/investments/accounts/<int:account_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_investment_account(account_id):
+    db = get_db()
+    account = db.execute(
+        '''SELECT *
+           FROM accounts
+           WHERE id = ?
+             AND user_id = ?
+             AND account_type = 'investment'
+             AND COALESCE(is_investment_dashboard, 0) = 1''',
+        (account_id, current_user.id),
+    ).fetchone()
+
+    if not account:
+        flash('Investment account not found.', 'danger')
+        return redirect(url_for('investments'))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        currency = normalize_currency(request.form.get('currency', 'EUR'))
+        income_profile = (request.form.get('income_profile', '') or '').strip().lower()
+
+        if not name:
+            flash('Investment account name is required.', 'danger')
+            return render_template('investment_account_form.html', account=account, profiles=INVESTMENT_INCOME_PROFILES)
+        if currency not in SUPPORTED_CURRENCIES:
+            flash('Unsupported currency.', 'danger')
+            return render_template('investment_account_form.html', account=account, profiles=INVESTMENT_INCOME_PROFILES)
+        if income_profile not in INVESTMENT_INCOME_PROFILES:
+            flash('Please select fixed or variable income profile.', 'danger')
+            return render_template('investment_account_form.html', account=account, profiles=INVESTMENT_INCOME_PROFILES)
+
+        db.execute(
+            '''UPDATE accounts
+               SET name = ?, currency = ?, income_profile = ?
+               WHERE id = ? AND user_id = ?''',
+            (name, currency, income_profile, account_id, current_user.id),
+        )
+        db.commit()
+        flash('Investment account updated successfully.', 'success')
+        return redirect(url_for('investments'))
+
+    return render_template('investment_account_form.html', account=account, profiles=INVESTMENT_INCOME_PROFILES)
+
+
+@app.route('/investments/accounts/<int:account_id>/delete', methods=['POST'])
+@login_required
+def delete_investment_account(account_id):
+    db = get_db()
+    account = db.execute(
+        '''SELECT id
+           FROM accounts
+           WHERE id = ?
+             AND user_id = ?
+             AND account_type = 'investment'
+             AND COALESCE(is_investment_dashboard, 0) = 1''',
+        (account_id, current_user.id),
+    ).fetchone()
+
+    if not account:
+        flash('Investment account not found.', 'danger')
+        return redirect(url_for('investments'))
+
+    linked_holding_count = db.execute(
+        'SELECT COUNT(*) AS c FROM investment_holdings WHERE user_id = ? AND account_id = ?',
+        (current_user.id, account_id),
+    ).fetchone()['c']
+    if linked_holding_count:
+        flash('Delete holdings in this account first.', 'warning')
+        return redirect(url_for('investments'))
+
+    db.execute(
+        'DELETE FROM investment_operations WHERE user_id = ? AND account_id = ?',
+        (current_user.id, account_id),
+    )
+    db.execute(
+        'DELETE FROM accounts WHERE id = ? AND user_id = ?',
+        (account_id, current_user.id),
+    )
+    db.commit()
+    flash('Investment account deleted.', 'info')
+    return redirect(url_for('investments'))
+
+
+@app.route('/investments/holdings/add', methods=['GET', 'POST'])
+@login_required
+def add_investment_holding():
+    db = get_db()
+    investment_accounts = get_investment_accounts(db, current_user.id)
+
+    if not investment_accounts:
+        flash('Create an investment account first.', 'warning')
+        return redirect(url_for('add_investment_account'))
+
+    if request.method == 'POST':
+        account_id = request.form.get('account_id', type=int)
+        asset_name = request.form.get('asset_name', '').strip()
+        ticker = request.form.get('ticker', '').strip().upper()
+        asset_class = request.form.get('asset_class', '').strip()
+        currency = normalize_currency(request.form.get('currency', 'USD'))
+
+        try:
+            quantity = parse_decimal_field(request.form.get('quantity', 0), 'Quantity', DECIMAL_QUANTITY_PLACES)
+            avg_cost = parse_decimal_field(request.form.get('avg_cost', 0), 'Average cost', DECIMAL_MONEY_PLACES)
+            current_price = parse_decimal_field(request.form.get('current_price', 0), 'Current price', DECIMAL_MONEY_PLACES)
+        except ValueError:
+            flash('Quantity and prices must be numeric.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+
+        valid_account = any(acc['id'] == account_id for acc in investment_accounts)
+        if not valid_account:
+            flash('Invalid investment account selected.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if not asset_name:
+            flash('Asset name is required.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if asset_class not in INVESTMENT_ASSET_CLASSES:
+            flash('Invalid asset class selected.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if asset_class == 'Mintos Lending':
+            quantity = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
+
+        if quantity < 0 or avg_cost < 0 or current_price < 0:
+            flash('Quantity and prices cannot be negative.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+
+        db.execute(
+            '''INSERT INTO investment_holdings
+               (user_id, account_id, asset_name, ticker, asset_class, currency, quantity, avg_cost, current_price, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+                (current_user.id, account_id, asset_name, ticker, asset_class, currency, float(quantity), float(avg_cost), float(current_price)),
+        )
+        db.commit()
+        flash('Holding added successfully.', 'success')
+        return redirect(url_for('investments'))
+
+    return render_template(
+        'investment_holding_form.html',
+        holding=None,
+        investment_accounts=investment_accounts,
+        asset_classes=INVESTMENT_ASSET_CLASSES,
+    )
+
+
+@app.route('/investments/holdings/<int:holding_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_investment_holding(holding_id):
+    db = get_db()
+    holding = db.execute(
+        '''SELECT h.*
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.id = ?
+             AND h.user_id = ?
+             AND a.user_id = ?
+             AND a.account_type = 'investment'
+             AND COALESCE(a.is_investment_dashboard, 0) = 1''',
+        (holding_id, current_user.id, current_user.id),
+    ).fetchone()
+
+    if not holding:
+        flash('Holding not found.', 'danger')
+        return redirect(url_for('investments'))
+
+    investment_accounts = get_investment_accounts(db, current_user.id)
+
+    if request.method == 'POST':
+        account_id = request.form.get('account_id', type=int)
+        asset_name = request.form.get('asset_name', '').strip()
+        ticker = request.form.get('ticker', '').strip().upper()
+        asset_class = request.form.get('asset_class', '').strip()
+        currency = normalize_currency(request.form.get('currency', 'USD'))
+
+        try:
+            quantity = parse_decimal_field(request.form.get('quantity', 0), 'Quantity', DECIMAL_QUANTITY_PLACES)
+            avg_cost = parse_decimal_field(request.form.get('avg_cost', 0), 'Average cost', DECIMAL_MONEY_PLACES)
+            current_price = parse_decimal_field(request.form.get('current_price', 0), 'Current price', DECIMAL_MONEY_PLACES)
+        except ValueError:
+            flash('Quantity and prices must be numeric.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+
+        valid_account = any(acc['id'] == account_id for acc in investment_accounts)
+        if not valid_account:
+            flash('Invalid investment account selected.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if not asset_name:
+            flash('Asset name is required.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if asset_class not in INVESTMENT_ASSET_CLASSES:
+            flash('Invalid asset class selected.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+        if asset_class == 'Mintos Lending':
+            quantity = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
+
+        if quantity < 0 or avg_cost < 0 or current_price < 0:
+            flash('Quantity and prices cannot be negative.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
+
+        db.execute(
+            '''UPDATE investment_holdings
+               SET account_id = ?,
+                   asset_name = ?,
+                   ticker = ?,
+                   asset_class = ?,
+                   currency = ?,
+                   quantity = ?,
+                   avg_cost = ?,
+                   current_price = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?''',
+            (
+                account_id,
+                asset_name,
+                ticker,
+                asset_class,
+                currency,
+                float(quantity),
+                float(avg_cost),
+                float(current_price),
+                holding_id,
+                current_user.id,
+            ),
+        )
+        db.commit()
+        flash('Holding updated successfully.', 'success')
+        return redirect(url_for('investments'))
+
+    return render_template(
+        'investment_holding_form.html',
+        holding=holding,
+        investment_accounts=investment_accounts,
+        asset_classes=INVESTMENT_ASSET_CLASSES,
+    )
+
+
+@app.route('/investments/holdings/<int:holding_id>/delete', methods=['POST'])
+@login_required
+def delete_investment_holding(holding_id):
+    db = get_db()
+    holding = db.execute('SELECT id FROM investment_holdings WHERE id = ? AND user_id = ?',
+                         (holding_id, current_user.id)).fetchone()
+    if not holding:
+        flash('Holding not found.', 'danger')
+        return redirect(url_for('investments'))
+
+    db.execute('DELETE FROM investment_valuations WHERE holding_id = ? AND user_id = ?',
+               (holding_id, current_user.id))
+    db.execute('DELETE FROM investment_operations WHERE holding_id = ? AND user_id = ?',
+               (holding_id, current_user.id))
+    db.execute('DELETE FROM investment_holdings WHERE id = ? AND user_id = ?',
+               (holding_id, current_user.id))
+    db.commit()
+    flash('Holding deleted.', 'info')
+    return redirect(url_for('investments'))
+
+
+@app.route('/investments/operations/add', methods=['GET', 'POST'])
+@login_required
+def add_investment_operation():
+    db = get_db()
+    investment_accounts = get_investment_accounts(db, current_user.id)
+    holdings = db.execute(
+        '''SELECT h.*, a.name AS account_name
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.user_id = ?
+             AND a.user_id = ?
+             AND a.account_type = 'investment'
+             AND COALESCE(a.is_investment_dashboard, 0) = 1
+           ORDER BY h.asset_name''',
+        (current_user.id, current_user.id),
+    ).fetchall()
+
+    if request.method == 'POST':
+        account_id = request.form.get('account_id', type=int)
+        holding_id = request.form.get('holding_id', type=int)
+        operation_type = (request.form.get('operation_type', '') or '').strip().lower()
+        note = request.form.get('note', '').strip()
+        currency = normalize_currency(request.form.get('currency', 'USD'))
+        operation_date = request.form.get('operation_date')
+        is_reinvested = request.form.get('is_reinvested') == 'on'
+
+        try:
+            quantity = parse_decimal_field(request.form.get('quantity', 0), 'Quantity', DECIMAL_QUANTITY_PLACES)
+            price_per_unit = parse_decimal_field(request.form.get('price_per_unit', 0), 'Price per unit', DECIMAL_MONEY_PLACES)
+            amount = parse_decimal_field(request.form.get('amount', 0), 'Amount', DECIMAL_MONEY_PLACES)
+        except ValueError:
+            flash('Quantity, price and amount must be numeric.', 'danger')
+            return render_template(
+                'investment_operation_form.html',
+                investment_accounts=investment_accounts,
+                holdings=holdings,
+                today=datetime.now().strftime('%Y-%m-%d'),
+            )
+
+        valid_account = any(acc['id'] == account_id for acc in investment_accounts)
+        if not valid_account:
+            flash('Invalid investment account selected.', 'danger')
+            return render_template(
+                'investment_operation_form.html',
+                investment_accounts=investment_accounts,
+                holdings=holdings,
+                today=datetime.now().strftime('%Y-%m-%d'),
+            )
+
+        holding = None
+        if holding_id:
+            holding = db.execute(
+                '''SELECT * FROM investment_holdings
+                   WHERE id = ? AND user_id = ? AND account_id = ?''',
+                (holding_id, current_user.id, account_id),
+            ).fetchone()
+            if not holding:
+                flash('Selected holding does not belong to this account.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+        if operation_type not in ('buy', 'sell', 'dividend', 'deposit'):
+            flash('Invalid operation type.', 'danger')
+            return render_template(
+                'investment_operation_form.html',
+                investment_accounts=investment_accounts,
+                holdings=holdings,
+                today=datetime.now().strftime('%Y-%m-%d'),
+            )
+
+        if not operation_date:
+            flash('Operation date is required.', 'danger')
+            return render_template(
+                'investment_operation_form.html',
+                investment_accounts=investment_accounts,
+                holdings=holdings,
+                today=datetime.now().strftime('%Y-%m-%d'),
+            )
+
+        realized_gain = None
+        if operation_type in ('buy', 'sell'):
+            if not holding:
+                flash('Buy and sell operations require selecting a holding.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+            if holding['asset_class'] == 'Mintos Lending':
+                flash('Mintos Lending is treated as account money. Use Evolution / Auto Returns instead of buy/sell.', 'warning')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+            if quantity <= 0 or price_per_unit <= 0:
+                flash('Quantity and price per unit must be positive.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+            amount = (quantity * price_per_unit).quantize(DECIMAL_MONEY_PLACES)
+
+            old_qty = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
+            old_avg = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+
+            if operation_type == 'buy':
+                new_qty = (old_qty + quantity).quantize(DECIMAL_QUANTITY_PLACES)
+                new_avg = (((old_qty * old_avg) + (quantity * price_per_unit)) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
+                db.execute(
+                    '''UPDATE investment_holdings
+                       SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ? AND user_id = ?''',
+                    (float(new_qty), float(new_avg), float(price_per_unit), holding['id'], current_user.id),
+                )
+            else:
+                if quantity - old_qty > FRACTIONAL_TOLERANCE:
+                    flash('Sell quantity cannot exceed current holding quantity.', 'danger')
+                    return render_template(
+                        'investment_operation_form.html',
+                        investment_accounts=investment_accounts,
+                        holdings=holdings,
+                        today=datetime.now().strftime('%Y-%m-%d'),
+                    )
+                new_qty = old_qty - quantity
+                if abs(new_qty) <= FRACTIONAL_TOLERANCE:
+                    new_qty = Decimal('0')
+                new_qty = new_qty.quantize(DECIMAL_QUANTITY_PLACES)
+                realized_gain = ((price_per_unit - old_avg) * quantity).quantize(DECIMAL_MONEY_PLACES)
+                db.execute(
+                    '''UPDATE investment_holdings
+                       SET quantity = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ? AND user_id = ?''',
+                    (float(new_qty), float(price_per_unit), holding['id'], current_user.id),
+                )
+
+        elif operation_type == 'dividend':
+            if amount <= 0:
+                flash('Dividend amount must be positive.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+            if is_reinvested:
+                if not holding:
+                    flash('Reinvested dividends require a holding.', 'danger')
+                    return render_template(
+                        'investment_operation_form.html',
+                        investment_accounts=investment_accounts,
+                        holdings=holdings,
+                        today=datetime.now().strftime('%Y-%m-%d'),
+                    )
+                if price_per_unit <= 0:
+                    flash('Reinvested dividends require a positive reinvest price.', 'danger')
+                    return render_template(
+                        'investment_operation_form.html',
+                        investment_accounts=investment_accounts,
+                        holdings=holdings,
+                        today=datetime.now().strftime('%Y-%m-%d'),
+                    )
+
+                if holding['asset_class'] == 'Mintos Lending':
+                    flash('Mintos Lending does not use dividend reinvest share logic. Use Deposit or Evolution instead.', 'warning')
+                    return render_template(
+                        'investment_operation_form.html',
+                        investment_accounts=investment_accounts,
+                        holdings=holdings,
+                        today=datetime.now().strftime('%Y-%m-%d'),
+                    )
+
+                old_qty = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
+                old_avg = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+                extra_qty = (amount / price_per_unit).quantize(DECIMAL_QUANTITY_PLACES)
+                new_qty = (old_qty + extra_qty).quantize(DECIMAL_QUANTITY_PLACES)
+                new_avg = (((old_qty * old_avg) + amount) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
+                db.execute(
+                    '''UPDATE investment_holdings
+                       SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ? AND user_id = ?''',
+                    (float(new_qty), float(new_avg), float(price_per_unit), holding['id'], current_user.id),
+                )
+
+        elif operation_type == 'deposit':
+            if not holding:
+                flash('Deposit operation requires selecting a holding.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+            if holding['asset_class'] != 'Mintos Lending':
+                flash('Deposit operation is currently only for Mintos Lending holdings.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+            if amount <= 0:
+                flash('Deposit amount must be positive.', 'danger')
+                return render_template(
+                    'investment_operation_form.html',
+                    investment_accounts=investment_accounts,
+                    holdings=holdings,
+                    today=datetime.now().strftime('%Y-%m-%d'),
+                )
+
+            old_invested = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+            old_value = Decimal(str(holding['current_price'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+            new_invested = (old_invested + amount).quantize(DECIMAL_MONEY_PLACES)
+            new_value = (old_value + amount).quantize(DECIMAL_MONEY_PLACES)
+
+            db.execute(
+                '''UPDATE investment_holdings
+                   SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND user_id = ?''',
+                (1.0, float(new_invested), float(new_value), holding['id'], current_user.id),
+            )
+
+            quantity = Decimal('0')
+            price_per_unit = Decimal('0')
+
+        db.execute(
+            '''INSERT INTO investment_operations
+               (user_id, account_id, holding_id, operation_type, quantity, price_per_unit, amount, currency,
+                is_reinvested, realized_gain, note, operation_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (
+                current_user.id,
+                account_id,
+                holding['id'] if holding else None,
+                operation_type,
+                float(quantity) if quantity > 0 else None,
+                float(price_per_unit) if price_per_unit > 0 else None,
+                float(amount),
+                currency,
+                1 if is_reinvested else 0,
+                float(realized_gain) if realized_gain is not None else None,
+                note,
+                operation_date,
+            ),
+        )
+
+        db.commit()
+        flash('Investment operation saved.', 'success')
+        return redirect(url_for('investments'))
+
+    return render_template(
+        'investment_operation_form.html',
+        investment_accounts=investment_accounts,
+        holdings=holdings,
+        today=datetime.now().strftime('%Y-%m-%d'),
+    )
+
+
+@app.route('/investments/snapshots/add', methods=['POST'])
+@login_required
+def add_investment_snapshot():
+    db = get_db()
+    snapshot_date = request.form.get('snapshot_date', '').strip()
+    currency = normalize_currency(request.form.get('currency', DEFAULT_BASE_CURRENCY))
+
+    try:
+        total_value = float(request.form.get('total_value', 0) or 0)
+    except ValueError:
+        flash('Snapshot total value must be numeric.', 'danger')
+        return redirect(url_for('investments'))
+
+    if not snapshot_date:
+        flash('Snapshot date is required.', 'danger')
+        return redirect(url_for('investments'))
+    if total_value <= 0:
+        flash('Snapshot value must be greater than zero.', 'danger')
+        return redirect(url_for('investments'))
+    if currency not in SUPPORTED_CURRENCIES:
+        flash('Unsupported snapshot currency.', 'danger')
+        return redirect(url_for('investments'))
+
+    db.execute(
+        '''INSERT INTO investment_snapshots (user_id, snapshot_date, total_value, currency)
+           VALUES (?, ?, ?, ?)''',
+        (current_user.id, snapshot_date, total_value, currency),
+    )
+    db.commit()
+    flash('Portfolio snapshot added.', 'success')
+    return redirect(url_for('investments'))
+
+
+@app.route('/investments/evolution/add', methods=['POST'])
+@login_required
+def add_investment_evolution():
+    db = get_db()
+    holding_id = request.form.get('holding_id', type=int)
+    valuation_date = (request.form.get('valuation_date') or '').strip()
+    total_value_raw = request.form.get('total_value', '')
+    return_pct_raw = request.form.get('return_pct', '')
+    note = (request.form.get('note') or '').strip()
+
+    holding = db.execute(
+        '''SELECT h.*, a.id AS account_id
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.id = ?
+             AND h.user_id = ?
+             AND a.user_id = ?
+             AND a.account_type = 'investment'
+             AND COALESCE(a.is_investment_dashboard, 0) = 1''',
+        (holding_id, current_user.id, current_user.id),
+    ).fetchone()
+
+    if not holding:
+        flash('Invalid holding selected.', 'danger')
+        return redirect(url_for('investments'))
+
+    if not valuation_date:
+        flash('Valuation date is required.', 'danger')
+        return redirect(url_for('investments'))
+
+    base_value = get_holding_base_value(db, current_user.id, holding, valuation_date)
+    quantity = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
+
+    holding_class = holding['asset_class']
+    computed_total_value = None
+    computed_return_amount = None
+    computed_return_pct = None
+
+    if holding_class == 'Mintos Lending':
+        try:
+            computed_total_value = parse_decimal_field(total_value_raw, 'Total value', DECIMAL_MONEY_PLACES)
+        except ValueError:
+            flash('Mintos evolution requires a valid total value.', 'danger')
+            return redirect(url_for('investments'))
+        if computed_total_value <= 0:
+            flash('Mintos total value must be greater than zero.', 'danger')
+            return redirect(url_for('investments'))
+
+        computed_return_amount = (computed_total_value - base_value).quantize(DECIMAL_MONEY_PLACES)
+        if base_value > 0:
+            computed_return_pct = ((computed_return_amount / base_value) * Decimal('100')).quantize(DECIMAL_MONEY_PLACES)
+
+    elif holding_class == 'Fixed Income Fund':
+        if quantity <= 0:
+            flash('Holding quantity must be greater than zero to apply fixed income yield.', 'danger')
+            return redirect(url_for('investments'))
+        try:
+            computed_return_pct = parse_decimal_field(return_pct_raw, 'Return %', DECIMAL_MONEY_PLACES)
+        except ValueError:
+            flash('Fixed income evolution requires a valid return %.', 'danger')
+            return redirect(url_for('investments'))
+
+        computed_return_amount = ((base_value * computed_return_pct) / Decimal('100')).quantize(DECIMAL_MONEY_PLACES)
+        computed_total_value = (base_value + computed_return_amount).quantize(DECIMAL_MONEY_PLACES)
+        if computed_total_value <= 0:
+            flash('Computed total value must stay positive.', 'danger')
+            return redirect(url_for('investments'))
+
+    else:
+        flash('Evolution automation is currently available for Mintos Lending and Fixed Income Fund holdings.', 'warning')
+        return redirect(url_for('investments'))
+
+    if holding_class == 'Mintos Lending':
+        new_price = computed_total_value
+        quantity_to_store = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
+    else:
+        new_price = (computed_total_value / quantity).quantize(DECIMAL_MONEY_PLACES)
+        quantity_to_store = quantity
+
+    db.execute(
+        '''INSERT INTO investment_valuations
+           (user_id, holding_id, valuation_date, total_value, currency, return_pct, return_amount, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        (
+            current_user.id,
+            holding['id'],
+            valuation_date,
+            float(computed_total_value),
+            holding['currency'],
+            float(computed_return_pct) if computed_return_pct is not None else None,
+            float(computed_return_amount) if computed_return_amount is not None else None,
+            note,
+        ),
+    )
+
+    db.execute(
+        '''UPDATE investment_holdings
+           SET quantity = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND user_id = ?''',
+        (float(quantity_to_store), float(new_price), holding['id'], current_user.id),
+    )
+
+    if computed_return_amount is not None and computed_return_amount > 0:
+        db.execute(
+            '''INSERT INTO investment_operations
+               (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date)
+               VALUES (?, ?, ?, 'dividend', ?, ?, 0, ?, ?)''',
+            (
+                current_user.id,
+                holding['account_id'],
+                holding['id'],
+                float(computed_return_amount),
+                holding['currency'],
+                f'Auto return from valuation. {note}'.strip(),
+                valuation_date,
+            ),
+        )
+
+    db.commit()
+    flash('Evolution recorded and returns auto-computed.', 'success')
+    return redirect(url_for('investments'))
 
 
 # Transaction routes

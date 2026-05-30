@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Edit Investment Account' if account else 'Add Investment Account' }} - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1><i class="bi bi-bank"></i> {{ 'Edit Investment Account' if account else 'Add Investment Account' }}</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-8 col-lg-6">
+        <div class="card">
+            <div class="card-body p-4">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="name" class="form-label">Account Name *</label>
+                        <input type="text" class="form-control" id="name" name="name" required
+                               value="{{ account.name if account else '' }}"
+                               placeholder="e.g., ETFs EUR">
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="income_profile" class="form-label">Income Profile *</label>
+                        <select class="form-select" id="income_profile" name="income_profile" required>
+                            <option value="">Select profile...</option>
+                            {% for profile in profiles %}
+                            <option value="{{ profile }}" {% if account and account.income_profile == profile %}selected{% endif %}>{{ profile | capitalize }}</option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text">Use fixed for predictable yields and variable for market-linked returns.</div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="currency" class="form-label">Currency *</label>
+                        <select class="form-select" id="currency" name="currency" required>
+                            {% for c in ['EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'MXN'] %}
+                            <option value="{{ c }}" {% if (account and account.currency == c) or (not account and c == 'USD') %}selected{% endif %}>{{ c }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('investments') }}" class="btn btn-outline-secondary">
+                            <i class="bi bi-arrow-left"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-lg"></i> {{ 'Save Changes' if account else 'Create Account' }}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

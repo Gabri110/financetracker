@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+
+{% block title %}Add Investment Operation - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1><i class="bi bi-plus-circle"></i> Add Investment Operation</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-10 col-lg-8">
+        <div class="card">
+            <div class="card-body p-4">
+                <form method="POST" id="operation-form">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="account_id" class="form-label">Investment Account *</label>
+                            <select class="form-select" id="account_id" name="account_id" required>
+                                <option value="">Select account...</option>
+                                {% for account in investment_accounts %}
+                                <option value="{{ account.id }}">{{ account.name }} ({{ account.currency }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="operation_type" class="form-label">Operation Type *</label>
+                            <select class="form-select" id="operation_type" name="operation_type" required>
+                                <option value="buy">Buy</option>
+                                <option value="sell">Sell</option>
+                                <option value="dividend">Dividend</option>
+                                <option value="deposit">Deposit (Mintos)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="holding_id" class="form-label">Holding</label>
+                        <select class="form-select" id="holding_id" name="holding_id">
+                            <option value="">Select holding...</option>
+                            {% for holding in holdings %}
+                            <option value="{{ holding.id }}" data-account-id="{{ holding.account_id }}" data-asset-class="{{ holding.asset_class }}">{{ holding.asset_name }} ({{ holding.account_name }})</option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text" id="holding-help">Required for buy/sell and for reinvested dividends.</div>
+                    </div>
+
+                    <div class="row" id="trade-inputs">
+                        <div class="col-md-4 mb-3" id="quantity-wrapper">
+                            <label for="quantity" class="form-label">Quantity</label>
+                            <input type="number" class="form-control" id="quantity" name="quantity" step="0.00000001" min="0" value="0">
+                        </div>
+                        <div class="col-md-4 mb-3" id="price-wrapper">
+                            <label for="price_per_unit" class="form-label">Price Per Unit</label>
+                            <input type="number" class="form-control" id="price_per_unit" name="price_per_unit" step="0.00000001" min="0" value="0">
+                        </div>
+                        <div class="col-md-4 mb-3" id="amount-wrapper">
+                            <label for="amount" class="form-label">Amount</label>
+                            <input type="number" class="form-control" id="amount" name="amount" step="0.00000001" min="0" value="0">
+                            <div class="form-text" id="amount-hint">For buy/sell this is auto-calculated from quantity x price.</div>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="operation_date" class="form-label">Date *</label>
+                            <input type="date" class="form-control" id="operation_date" name="operation_date" value="{{ today }}" required>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="currency" class="form-label">Currency *</label>
+                            <select class="form-select" id="currency" name="currency" required>
+                                {% for c in ['EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'MXN'] %}
+                                <option value="{{ c }}" {% if c == 'USD' %}selected{% endif %}>{{ c }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-check mb-3" id="reinvest-wrapper" style="display: none;">
+                        <input class="form-check-input" type="checkbox" id="is_reinvested" name="is_reinvested">
+                        <label class="form-check-label" for="is_reinvested">Reinvest dividend into holding</label>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="note" class="form-label">Note</label>
+                        <textarea class="form-control" id="note" name="note" rows="3" placeholder="Optional details"></textarea>
+                    </div>
+
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('investments') }}" class="btn btn-outline-secondary">
+                            <i class="bi bi-arrow-left"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-lg"></i> Save Operation
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+    const operationType = document.getElementById('operation_type');
+    const reinvestWrapper = document.getElementById('reinvest-wrapper');
+    const accountSelect = document.getElementById('account_id');
+    const holdingSelect = document.getElementById('holding_id');
+    const quantityInput = document.getElementById('quantity');
+    const priceInput = document.getElementById('price_per_unit');
+    const amountInput = document.getElementById('amount');
+    const amountHint = document.getElementById('amount-hint');
+    const holdingHelp = document.getElementById('holding-help');
+    const tradeInputs = document.getElementById('trade-inputs');
+    const quantityWrapper = document.getElementById('quantity-wrapper');
+    const priceWrapper = document.getElementById('price-wrapper');
+    const amountWrapper = document.getElementById('amount-wrapper');
+
+    function selectedHoldingClass() {
+        const selected = holdingSelect.options[holdingSelect.selectedIndex];
+        return selected ? selected.dataset.assetClass : '';
+    }
+
+    function isTradeType() {
+        return operationType.value === 'buy' || operationType.value === 'sell';
+    }
+
+    function toNumber(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function syncAutoAmount() {
+        const isDeposit = operationType.value === 'deposit';
+        const isDividend = operationType.value === 'dividend';
+
+        if (isDeposit) {
+            tradeInputs.style.display = 'flex';
+            quantityWrapper.style.display = 'none';
+            priceWrapper.style.display = 'none';
+            amountWrapper.className = 'col-md-12 mb-3';
+            amountInput.readOnly = false;
+            amountInput.classList.remove('bg-light');
+            amountHint.textContent = 'Enter the deposited amount for Mintos.';
+            holdingHelp.textContent = 'Deposit is only for Mintos Lending holdings and records money added to the account.';
+            return;
+        }
+
+        tradeInputs.style.display = 'flex';
+        quantityWrapper.style.display = 'block';
+        priceWrapper.style.display = 'block';
+        amountWrapper.className = 'col-md-4 mb-3';
+
+        if (!isTradeType()) {
+            amountInput.readOnly = false;
+            amountInput.classList.remove('bg-light');
+            amountHint.textContent = isDividend
+                ? 'Enter dividend amount manually.'
+                : 'Enter operation amount manually.';
+            holdingHelp.textContent = 'Required for buy/sell and for reinvested dividends.';
+            return;
+        }
+
+        const quantity = toNumber(quantityInput.value);
+        const price = toNumber(priceInput.value);
+        const computed = quantity * price;
+        amountInput.value = computed.toFixed(8);
+        amountInput.readOnly = true;
+        amountInput.classList.add('bg-light');
+        amountHint.textContent = 'Auto-calculated from quantity x price for buy/sell.';
+        holdingHelp.textContent = 'Required for buy/sell and for reinvested dividends.';
+    }
+
+    function syncDividendState() {
+        reinvestWrapper.style.display = operationType.value === 'dividend' ? 'block' : 'none';
+
+        if (operationType.value === 'deposit' && selectedHoldingClass() && selectedHoldingClass() !== 'Mintos Lending') {
+            holdingHelp.textContent = 'Select a Mintos Lending holding for deposit operations.';
+        }
+        syncAutoAmount();
+    }
+
+    function filterHoldingsByAccount() {
+        const selectedAccountId = accountSelect.value;
+        const options = holdingSelect.querySelectorAll('option[data-account-id]');
+        options.forEach((option) => {
+            const visible = !selectedAccountId || option.dataset.accountId === selectedAccountId;
+            option.hidden = !visible;
+            if (!visible && option.selected) {
+                option.selected = false;
+            }
+        });
+    }
+
+    operationType.addEventListener('change', syncDividendState);
+    accountSelect.addEventListener('change', filterHoldingsByAccount);
+    holdingSelect.addEventListener('change', syncDividendState);
+    quantityInput.addEventListener('input', syncAutoAmount);
+    priceInput.addEventListener('input', syncAutoAmount);
+
+    syncDividendState();
+    filterHoldingsByAccount();
+    syncAutoAmount();
+})();
+</script>
+{% endblock %}

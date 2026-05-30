@@ -1,0 +1,435 @@
+{% extends "base.html" %}
+
+{% block title %}Investments - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <h1><i class="bi bi-graph-up-arrow"></i> Investments</h1>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('add_investment_account') }}" class="btn btn-outline-primary">
+            <i class="bi bi-bank"></i> Add Investment Account
+        </a>
+        <a href="{{ url_for('add_investment_holding') }}" class="btn btn-primary">
+            <i class="bi bi-plus-lg"></i> Add Holding
+        </a>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Portfolio Value</div>
+            <div class="stat-value text-primary">{{ format_currency(total_portfolio_value, base_currency) }}</div>
+            <small class="text-muted">Base {{ base_currency }}</small>
+        </div>
+    </div>
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Invested Capital</div>
+            <div class="stat-value">{{ format_currency(invested_capital, base_currency) }}</div>
+            <small class="text-muted">Cost basis</small>
+        </div>
+    </div>
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Unrealized P/L</div>
+            <div class="stat-value {% if unrealized_gain >= 0 %}text-success{% else %}text-danger{% endif %}">
+                {{ format_currency(unrealized_gain, base_currency) }}
+            </div>
+            <small class="text-muted">Mark-to-market</small>
+        </div>
+    </div>
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Realized P/L</div>
+            <div class="stat-value {% if realized_gain >= 0 %}text-success{% else %}text-danger{% endif %}">
+                {{ format_currency(realized_gain, base_currency) }}
+            </div>
+            <small class="text-muted">Closed operations</small>
+        </div>
+    </div>
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Dividends MTD</div>
+            <div class="stat-value text-success">{{ format_currency(dividend_mtd, base_currency) }}</div>
+            <small class="text-muted">Current month</small>
+        </div>
+    </div>
+    <div class="col-md-4 col-xl-2 mb-3">
+        <div class="card stat-card h-100">
+            <div class="stat-label">Dividends YTD</div>
+            <div class="stat-value text-success">{{ format_currency(dividend_ytd, base_currency) }}</div>
+            <small class="text-muted">Current year</small>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-lg-12 mb-4">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-bank"></i> Investment Accounts</div>
+            <div class="card-body">
+                {% if investment_accounts %}
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Income Profile</th>
+                                <th>Currency</th>
+                                <th class="text-end">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for account in investment_accounts %}
+                            <tr>
+                                <td>{{ account.name }}</td>
+                                <td>{{ (account.income_profile or 'n/a') | capitalize }}</td>
+                                <td>{{ account.currency }}</td>
+                                <td class="text-end">
+                                    <a href="{{ url_for('edit_investment_account', account_id=account.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>
+                                    <form method="POST" action="{{ url_for('delete_investment_account', account_id=account.id) }}" class="d-inline"
+                                          onsubmit="return confirm('Delete this investment account?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state py-4">
+                    <i class="bi bi-bank"></i>
+                    <p>No investment accounts yet.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-8 mb-4">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-grid"></i> Holdings</span>
+                <a href="{{ url_for('add_investment_operation') }}" class="btn btn-sm btn-outline-primary">Add Operation</a>
+            </div>
+            <div class="card-body">
+                {% if holdings %}
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Asset</th>
+                                <th>Class</th>
+                                <th>Account</th>
+                                <th class="text-end">Quantity</th>
+                                <th class="text-end">Avg Cost</th>
+                                <th class="text-end">Price</th>
+                                <th class="text-end">Unrealized</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for holding in holdings %}
+                            <tr>
+                                <td>
+                                    <div class="fw-semibold">{{ holding.asset_name }}</div>
+                                    <small class="text-muted">{{ holding.ticker or 'N/A' }} &middot; {{ holding.currency }}</small>
+                                </td>
+                                <td>{{ holding.asset_class }}</td>
+                                <td>
+                                    {{ holding.account_name }}
+                                    <br>
+                                    <small class="text-muted">{{ (holding.account_income_profile or 'n/a') | capitalize }}</small>
+                                </td>
+                                <td class="text-end">
+                                    {% if holding.asset_class == 'Mintos Lending' %}
+                                    <span class="text-muted">Cash account</span>
+                                    {% else %}
+                                    {{ "{:.8f}".format(holding.quantity) }}
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if holding.asset_class == 'Mintos Lending' %}
+                                    {{ format_currency(holding.cost_basis, holding.currency) }}
+                                    {% else %}
+                                    {{ format_currency(holding.avg_cost, holding.currency) }}
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if holding.asset_class == 'Mintos Lending' %}
+                                    {{ format_currency(holding.current_value, holding.currency) }}
+                                    {% else %}
+                                    {{ format_currency(holding.current_price, holding.currency) }}
+                                    {% endif %}
+                                </td>
+                                <td class="text-end {% if holding.unrealized_gain >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                    {{ format_currency(holding.unrealized_gain, holding.currency) }}
+                                </td>
+                                <td class="text-end">
+                                    <a href="{{ url_for('edit_investment_holding', holding_id=holding.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>
+                                    <form method="POST" action="{{ url_for('delete_investment_holding', holding_id=holding.id) }}" class="d-inline"
+                                          onsubmit="return confirm('Delete this holding and its linked operations?');">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state">
+                    <i class="bi bi-graph-up"></i>
+                    <p>No holdings yet. Add your first investment asset.</p>
+                    <a href="{{ url_for('add_investment_holding') }}" class="btn btn-primary btn-sm">Add Holding</a>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4 mb-4">
+        <div class="card mb-4">
+            <div class="card-header"><i class="bi bi-pie-chart"></i> Allocation By Asset Class</div>
+            <div class="card-body">
+                {% if allocation_data %}
+                <canvas id="allocationChart" height="220"></canvas>
+                {% else %}
+                <div class="empty-state py-4">
+                    <i class="bi bi-pie-chart"></i>
+                    <p>No allocation data yet.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><i class="bi bi-camera"></i> Add Portfolio Snapshot</div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('add_investment_snapshot') }}" class="row g-2">
+                    <div class="col-12">
+                        <label class="form-label">Date</label>
+                        <input type="date" class="form-control" name="snapshot_date" value="{{ today }}" required>
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">Value</label>
+                        <input type="number" class="form-control" name="total_value" step="0.01" min="0" required>
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">Currency</label>
+                        <select class="form-select" name="currency">
+                            <option value="{{ base_currency }}" selected>{{ base_currency }}</option>
+                            {% for c in ['EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'MXN'] %}
+                            {% if c != base_currency %}
+                            <option value="{{ c }}">{{ c }}</option>
+                            {% endif %}
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-12 d-grid">
+                        <button type="submit" class="btn btn-outline-primary">Save Snapshot</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-header"><i class="bi bi-percent"></i> Evolution / Auto Returns</div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('add_investment_evolution') }}" class="row g-2" id="evolution-form">
+                    <div class="col-12">
+                        <label class="form-label">Holding</label>
+                        <select class="form-select" name="holding_id" id="evolution-holding" required>
+                            <option value="">Select holding...</option>
+                            {% for holding in holdings %}
+                            <option value="{{ holding.id }}" data-asset-class="{{ holding.asset_class }}">
+                                {{ holding.asset_name }} ({{ holding.asset_class }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label">Date</label>
+                        <input type="date" class="form-control" name="valuation_date" value="{{ today }}" required>
+                    </div>
+                    <div class="col-12" id="evolution-total-wrapper">
+                        <label class="form-label">New Total Value (Mintos)</label>
+                        <input type="number" class="form-control" name="total_value" id="evolution-total" step="0.00000001" min="0">
+                    </div>
+                    <div class="col-12" id="evolution-pct-wrapper">
+                        <label class="form-label">Daily Return % (Fixed Income)</label>
+                        <input type="number" class="form-control" name="return_pct" id="evolution-pct" step="0.00000001">
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label">Note</label>
+                        <input type="text" class="form-control" name="note" placeholder="Optional">
+                    </div>
+                    <div class="col-12 d-grid">
+                        <button type="submit" class="btn btn-outline-primary">Record Evolution</button>
+                    </div>
+                    <div class="col-12">
+                        <small class="text-muted" id="evolution-help">
+                            Mintos: set new total value. Fixed income funds: set daily return %.
+                        </small>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-lg-8 mb-4">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-activity"></i> Portfolio Performance</div>
+            <div class="card-body">
+                {% if performance_points %}
+                <canvas id="performanceChart" height="120"></canvas>
+                {% else %}
+                <div class="empty-state py-4">
+                    <i class="bi bi-activity"></i>
+                    <p>Add snapshots over time to view performance trend.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4 mb-4">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-clock-history"></i> Recent Operations</div>
+            <div class="card-body" style="max-height: 350px; overflow-y: auto;">
+                {% if recent_operations %}
+                {% for op in recent_operations %}
+                <div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom">
+                    <div>
+                        <strong>{{ op.operation_type | upper }}</strong>
+                        <br>
+                        <small class="text-muted">{{ op.account_name }}{% if op.asset_name %} &middot; {{ op.asset_name }}{% endif %}</small>
+                    </div>
+                    <div class="text-end">
+                        <div>{{ format_currency(op.amount, op.currency) }}</div>
+                        <small class="text-muted">{{ op.operation_date }}</small>
+                    </div>
+                </div>
+                {% endfor %}
+                {% else %}
+                <div class="empty-state py-4">
+                    <i class="bi bi-clock-history"></i>
+                    <p>No operations yet.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{% if allocation_data %}
+<script>
+const allocationCtx = document.getElementById('allocationChart').getContext('2d');
+new Chart(allocationCtx, {
+    type: 'doughnut',
+    data: {
+        labels: {{ allocation_data | map(attribute='asset_class') | list | tojson }},
+        datasets: [{
+            data: {{ allocation_data | map(attribute='total') | list | tojson }},
+            backgroundColor: ['#1f77b4', '#2ca02c', '#ff7f0e', '#17becf', '#9467bd'],
+            borderWidth: 0
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            legend: {
+                position: 'bottom'
+            }
+        }
+    }
+});
+</script>
+{% endif %}
+
+{% if performance_points %}
+<script>
+const performanceCtx = document.getElementById('performanceChart').getContext('2d');
+new Chart(performanceCtx, {
+    type: 'line',
+    data: {
+        labels: {{ performance_points | map(attribute='date') | list | tojson }},
+        datasets: [{
+            label: 'Portfolio Value ({{ base_currency }})',
+            data: {{ performance_points | map(attribute='value') | list | tojson }},
+            borderColor: '#2c3e50',
+            backgroundColor: 'rgba(52, 152, 219, 0.15)',
+            borderWidth: 2,
+            fill: true,
+            tension: 0.3
+        }]
+    },
+    options: {
+        responsive: true,
+        scales: {
+            y: {
+                ticks: {
+                    callback: function(value) {
+                        return '{{ base_currency }} ' + value.toLocaleString();
+                    }
+                }
+            }
+        }
+    }
+});
+</script>
+{% endif %}
+
+<script>
+(function () {
+    const holdingSelect = document.getElementById('evolution-holding');
+    const totalWrapper = document.getElementById('evolution-total-wrapper');
+    const pctWrapper = document.getElementById('evolution-pct-wrapper');
+    const totalInput = document.getElementById('evolution-total');
+    const pctInput = document.getElementById('evolution-pct');
+    const help = document.getElementById('evolution-help');
+
+    if (!holdingSelect) {
+        return;
+    }
+
+    function syncMode() {
+        const selected = holdingSelect.options[holdingSelect.selectedIndex];
+        const assetClass = selected ? selected.dataset.assetClass : '';
+
+        if (assetClass === 'Mintos Lending') {
+            totalWrapper.style.display = 'block';
+            pctWrapper.style.display = 'none';
+            totalInput.required = true;
+            pctInput.required = false;
+            help.textContent = 'Mintos selected: enter the new total value. Positive delta is recorded as automatic return.';
+            return;
+        }
+
+        if (assetClass === 'Fixed Income Fund') {
+            totalWrapper.style.display = 'none';
+            pctWrapper.style.display = 'block';
+            totalInput.required = false;
+            pctInput.required = true;
+            help.textContent = 'Fixed Income Fund selected: enter return % for the day; return amount is auto-computed.';
+            return;
+        }
+
+        totalWrapper.style.display = 'none';
+        pctWrapper.style.display = 'none';
+        totalInput.required = false;
+        pctInput.required = false;
+        help.textContent = 'Select Mintos Lending or Fixed Income Fund holding to enable automation.';
+    }
+
+    holdingSelect.addEventListener('change', syncMode);
+    syncMode();
+})();
+</script>
+{% endblock %}

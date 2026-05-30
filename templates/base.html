@@ -297,6 +297,11 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if request.endpoint in ['investments', 'add_investment_account', 'edit_investment_account', 'add_investment_holding', 'edit_investment_holding', 'add_investment_operation'] %}active{% endif %}" href="{{ url_for('investments') }}">
+                                <i class="bi bi-graph-up-arrow"></i> Investments
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if request.endpoint in ['options', 'set_base_currency', 'sync_exchange_rates', 'update_exchange_rate'] %}active{% endif %}" href="{{ url_for('options') }}">
                                 <i class="bi bi-sliders"></i> Options
                             </a>
