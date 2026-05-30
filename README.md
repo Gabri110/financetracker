@@ -14,6 +14,13 @@ A simple, powerful personal finance application similar to Quicken and Microsoft
 - **CSV Import** - Import bank statements with automatic format detection (US/European)
 - **Category Management** - Custom categories with icons and colors
 - **Reports & Charts** - Visual spending analysis, monthly trends, savings rate
+- **Multi-Currency Accounts** - Keep each account in its native currency while still seeing unified totals
+
+### Currency & Exchange Rates
+- **Account Currency Display** - Transaction rows and account-level values are shown in each account's own currency
+- **Base Currency Conversion** - Dashboard, budget, and report aggregates are converted into your selected base currency
+- **ECB Daily Sync** - Exchange rates can be synced from the European Central Bank (ECB)
+- **Manual Rate Overrides** - Edit or insert custom FX rates from the UI when needed
 
 ### Smart Categorization
 - **Auto-Categorization Rules** - Create patterns to automatically categorize transactions
@@ -170,6 +177,19 @@ financetracker/
 4. Select the category
 5. Rules are applied during import and email processing
 
+### Managing Currencies (Web App)
+
+1. Go to **Options** in the sidebar.
+2. Select your **Base Currency for Aggregates** and save.
+3. Click **Sync ECB Rates Now** to refresh rates.
+4. Use **Add / Override Rate Manually** to create or update a rate pair.
+5. Optionally edit an existing rate inline in the rates table.
+
+Behavior notes:
+- Dashboard cards, reports, and budget totals are converted to your selected base currency.
+- Transaction and clearing rows keep account-native currency values.
+- If a conversion rate is missing, the app falls back to the original amount to avoid blocking the UI.
+
 ## API Endpoints
 
 ### Email Webhook
@@ -183,6 +203,15 @@ Receives forwarded emails from SendGrid, Mailgun, or Postmark.
 POST /api/transaction/<id>/categorize
 POST /api/auto-categorize
 ```
+
+### Currency Options API (Session Auth)
+```
+GET /options
+POST /options/base-currency
+POST /options/sync-rates
+POST /options/rates/update
+```
+These endpoints power the web Options page for base currency and exchange-rate management.
 
 ## Deployment
 
@@ -232,6 +261,7 @@ FinanceTracker also ships as a **native desktop application** for Windows, macOS
 - Uses a local SQLite file you choose (no login/password)
 - Supports **English**, **Portuguese (BR)**, and **Spanish**
 - Includes a **bundled demo database** so you can try it instantly
+- Includes **Options** for base currency, daily ECB sync, and manual exchange-rate edits
 
 See [`desktop/README.md`](desktop/README.md) for build instructions.
 

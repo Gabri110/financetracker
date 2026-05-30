@@ -58,7 +58,27 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             priority    INTEGER NOT NULL DEFAULT 0,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            from_currency TEXT NOT NULL,
+            to_currency   TEXT NOT NULL,
+            rate          REAL NOT NULL,
+            provider      TEXT NOT NULL DEFAULT 'manual',
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (from_currency, to_currency)
+        );
         ",
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('base_currency', 'USD')",
+        [],
     )?;
 
     seed_default_categories(conn)?;

@@ -46,6 +46,7 @@
     "budgets": "Presupuestos",
     "reports": "Informes",
     "importCsv": "Importar CSV",
+    "options": "Opciones",
     "switchDatabase": "Cambiar Base de Datos"
   },
   "welcome": {
@@ -211,5 +212,18 @@
     "skip": "Omitir",
     "nextJ": "(J)",
     "keyHint": "Presiona 1\u20139 para categorizar instant\u00e1neamente"
+  },
+  "options": {
+    "title": "Opciones",
+    "baseCurrency": "Moneda base",
+    "syncNow": "Sincronizar tasas ECB ahora",
+    "autoSyncHint": "Las tasas se actualizan diariamente al abrir informes y presupuestos. Tambi\u00e9n puedes sobrescribir cualquier tasa manualmente abajo.",
+    "rates": "Tipos de cambio",
+    "fromCurrency": "Desde",
+    "toCurrency": "Hacia",
+    "rate": "Tipo",
+    "provider": "Proveedor",
+    "updatedAt": "Actualizado",
+    "invalidRate": "El tipo debe ser un n\u00famero positivo."
   }
 }

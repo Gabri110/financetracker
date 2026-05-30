@@ -46,6 +46,7 @@
     "budgets": "Budgets",
     "reports": "Reports",
     "importCsv": "Import CSV",
+    "options": "Options",
     "switchDatabase": "Switch Database"
   },
   "welcome": {
@@ -211,5 +212,18 @@
     "skip": "Skip",
     "nextJ": "(J)",
     "keyHint": "Press 1\u20139 to categorize instantly"
+  },
+  "options": {
+    "title": "Options",
+    "baseCurrency": "Base Currency",
+    "syncNow": "Sync ECB Rates Now",
+    "autoSyncHint": "Rates auto-refresh daily when reports and budgets are loaded. You can also override any rate manually below.",
+    "rates": "Exchange Rates",
+    "fromCurrency": "From",
+    "toCurrency": "To",
+    "rate": "Rate",
+    "provider": "Provider",
+    "updatedAt": "Updated",
+    "invalidRate": "Rate must be a positive number."
   }
 }

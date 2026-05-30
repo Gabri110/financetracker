@@ -49,6 +49,15 @@ export const updateRule = (id, categoryId, pattern, matchField, isRegex, priorit
 export const deleteRule = (id) => invoke("delete_rule", { id });
 export const autoCategorize = () => invoke("auto_categorize");
 
+// FX / settings
+export const getBaseCurrency = () => invoke("get_base_currency");
+export const setBaseCurrency = (currency) => invoke("set_base_currency", { currency });
+export const syncEcbRates = () => invoke("sync_ecb_rates");
+export const getExchangeRates = (toCurrency) =>
+  invoke("get_exchange_rates", { toCurrency: toCurrency ?? null });
+export const setExchangeRate = (fromCurrency, toCurrency, rate) =>
+  invoke("set_exchange_rate", { fromCurrency, toCurrency, rate });
+
 // Reports
 export const getDashboardStats = () => invoke("get_dashboard_stats");
 export const getMonthlyData = (months) => invoke("get_monthly_data", { months });

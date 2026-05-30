@@ -12,6 +12,7 @@ import Budgets from "./pages/Budgets";
 import Reports from "./pages/Reports";
 import Import from "./pages/Import";
 import Clear from "./pages/Clear";
+import Options from "./pages/Options";
 
 export const DbContext = createContext(null);
 export const useDb = () => useContext(DbContext);
@@ -53,6 +54,7 @@ export default function App() {
               <Route path="/reports" element={<Reports />} />
               <Route path="/import" element={<Import />} />
               <Route path="/clear" element={<Clear />} />
+              <Route path="/options" element={<Options />} />
             </Routes>
           </Layout>
         )}

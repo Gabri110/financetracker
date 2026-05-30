@@ -18,8 +18,9 @@
                 <div>
                     <div class="stat-label">Total Balance</div>
                     <div class="stat-value {% if total_balance >= 0 %}text-success{% else %}text-danger{% endif %}">
-                        ${{ "{:,.2f}".format(total_balance) }}
+                        {{ format_currency(total_balance, base_currency) }}
                     </div>
+                    <small class="text-muted">Converted to {{ base_currency }}</small>
                 </div>
                 <div class="stat-icon bg-primary bg-opacity-10 text-primary">
                     <i class="bi bi-wallet2"></i>
@@ -34,8 +35,9 @@
                 <div>
                     <div class="stat-label">Monthly Income</div>
                     <div class="stat-value text-success">
-                        ${{ "{:,.2f}".format(monthly_income) }}
+                        {{ format_currency(monthly_income, base_currency) }}
                     </div>
+                    <small class="text-muted">Converted to {{ base_currency }}</small>
                 </div>
                 <div class="stat-icon bg-success bg-opacity-10 text-success">
                     <i class="bi bi-arrow-down-circle"></i>
@@ -50,8 +52,9 @@
                 <div>
                     <div class="stat-label">Monthly Expenses</div>
                     <div class="stat-value text-danger">
-                        ${{ "{:,.2f}".format(monthly_expenses) }}
+                        {{ format_currency(monthly_expenses, base_currency) }}
                     </div>
+                    <small class="text-muted">Converted to {{ base_currency }}</small>
                 </div>
                 <div class="stat-icon bg-danger bg-opacity-10 text-danger">
                     <i class="bi bi-arrow-up-circle"></i>
@@ -82,7 +85,7 @@
                         </div>
                         <div class="text-end">
                             <span class="{% if account.calculated_balance >= 0 %}text-success{% else %}text-danger{% endif %}">
-                                ${{ "{:,.2f}".format(account.calculated_balance) }}
+                                {{ format_currency(account.calculated_balance, account.currency) }}
                             </span>
                         </div>
                     </div>
@@ -136,7 +139,7 @@
                         </div>
                         <div class="text-end">
                             <span class="{% if trans.transaction_type == 'income' %}transaction-income{% else %}transaction-expense{% endif %}">
-                                {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}${{ "{:,.2f}".format(trans.amount) }}
+                                {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}{{ format_currency(trans.amount, trans.account_currency) }}
                             </span>
                         </div>
                     </div>

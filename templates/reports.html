@@ -52,7 +52,7 @@
                             <span class="badge" style="background-color: {{ cat.color }}; width: 12px; height: 12px; display: inline-block; border-radius: 50%;"></span>
                             {{ cat.name }}
                         </div>
-                        <strong>${{ "{:,.2f}".format(cat.total) }}</strong>
+                        <strong>{{ format_currency(cat.total, base_currency) }}</strong>
                     </div>
                     {% endfor %}
                 </div>
@@ -90,7 +90,7 @@
                             <tr>
                                 <td>{{ payee.payee }}</td>
                                 <td class="text-end">{{ payee.count }}</td>
-                                <td class="text-end text-danger">${{ "{:,.2f}".format(payee.total) }}</td>
+                                <td class="text-end text-danger">{{ format_currency(payee.total, base_currency) }}</td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -123,26 +123,27 @@
                 <div class="row text-center">
                     <div class="col-6 mb-4">
                         <div class="text-muted small">Total Income ({{ monthly_data | length }} months)</div>
-                        <div class="fs-4 text-success">${{ "{:,.2f}".format(total_income) }}</div>
+                        <div class="fs-4 text-success">{{ format_currency(total_income, base_currency) }}</div>
                     </div>
                     <div class="col-6 mb-4">
                         <div class="text-muted small">Total Expenses ({{ monthly_data | length }} months)</div>
-                        <div class="fs-4 text-danger">${{ "{:,.2f}".format(total_expenses) }}</div>
+                        <div class="fs-4 text-danger">{{ format_currency(total_expenses, base_currency) }}</div>
                     </div>
                     <div class="col-6 mb-4">
                         <div class="text-muted small">Avg Monthly Income</div>
-                        <div class="fs-4 text-success">${{ "{:,.2f}".format(avg_monthly_income) }}</div>
+                        <div class="fs-4 text-success">{{ format_currency(avg_monthly_income, base_currency) }}</div>
                     </div>
                     <div class="col-6 mb-4">
                         <div class="text-muted small">Avg Monthly Expenses</div>
-                        <div class="fs-4 text-danger">${{ "{:,.2f}".format(avg_monthly_expenses) }}</div>
+                        <div class="fs-4 text-danger">{{ format_currency(avg_monthly_expenses, base_currency) }}</div>
                     </div>
                     <div class="col-12">
                         <hr>
                         <div class="text-muted small">Net Savings</div>
                         <div class="fs-3 {% if net_savings >= 0 %}text-success{% else %}text-danger{% endif %}">
-                            ${{ "{:,.2f}".format(net_savings) }}
+                            {{ format_currency(net_savings, base_currency) }}
                         </div>
+                        <div class="text-muted small">Converted to {{ base_currency }}</div>
                         {% if total_income > 0 %}
                         <div class="text-muted small">
                             Savings Rate: {{ "{:.1f}".format((net_savings / total_income) * 100) }}%
@@ -192,7 +193,7 @@ new Chart(monthlyCtx, {
                 beginAtZero: true,
                 ticks: {
                     callback: function(value) {
-                        return '$' + value.toLocaleString();
+                        return '{{ base_currency }} ' + value.toLocaleString();
                     }
                 }
             }
@@ -201,7 +202,7 @@ new Chart(monthlyCtx, {
             tooltip: {
                 callbacks: {
                     label: function(context) {
-                        return context.dataset.label + ': $' + context.raw.toLocaleString();
+                        return context.dataset.label + ': {{ base_currency }} ' + context.raw.toLocaleString();
                     }
                 }
             }
@@ -234,7 +235,7 @@ new Chart(categoryCtx, {
             tooltip: {
                 callbacks: {
                     label: function(context) {
-                        return context.label + ': $' + context.raw.toLocaleString();
+                        return context.label + ': {{ base_currency }} ' + context.raw.toLocaleString();
                     }
                 }
             }

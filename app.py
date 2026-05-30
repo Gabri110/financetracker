@@ -4,8 +4,11 @@ import io
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from datetime import datetime
 from functools import wraps
+from urllib import request as urllib_request
+import xml.etree.ElementTree as ET
 
 from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
@@ -21,9 +24,42 @@ app.config['DATABASE'] = os.environ.get('DATABASE', 'finance.db')
 app.config['SAAS_MODE'] = os.environ.get('SAAS_MODE', 'false').lower() == 'true'
 app.config['REGISTRATION_ENABLED'] = os.environ.get('REGISTRATION_ENABLED', 'true').lower() == 'true'
 
+DEFAULT_BASE_CURRENCY = 'EUR'
+ECB_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
+SUPPORTED_CURRENCIES = {'EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN'}
+SYMBOL_BY_CURRENCY = {
+    'EUR': '€',
+    'USD': '$',
+    'GBP': '£',
+    'JPY': '¥',
+    'CAD': 'C$',
+    'AUD': 'A$',
+    'CHF': 'CHF',
+    'SEK': 'kr',
+    'NOK': 'kr',
+    'DKK': 'kr',
+    'MXN': 'MX$',
+}
+
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+
+
+def normalize_currency(currency):
+    normalized = (currency or '').strip().upper()
+    if not normalized:
+        return DEFAULT_BASE_CURRENCY
+    return normalized
+
+
+def format_currency(amount, currency):
+    normalized = normalize_currency(currency)
+    symbol = SYMBOL_BY_CURRENCY.get(normalized, normalized)
+    return f"{symbol}{float(amount):,.2f}"
+
+
+app.jinja_env.globals['format_currency'] = format_currency
 
 # Register SaaS blueprint if in SaaS mode
 if app.config['SAAS_MODE']:
@@ -153,6 +189,15 @@ def init_db():
             FOREIGN KEY (suggested_category_id) REFERENCES categories (id),
             FOREIGN KEY (transaction_id) REFERENCES transactions (id)
         );
+
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            from_currency TEXT NOT NULL,
+            to_currency TEXT NOT NULL,
+            rate REAL NOT NULL,
+            provider TEXT DEFAULT 'ecb',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (from_currency, to_currency)
+        );
     ''')
 
     # Add optional external transaction reference used by CSV imports.
@@ -162,7 +207,232 @@ def init_db():
     if 'id_transaction' not in transaction_columns:
         db.execute('ALTER TABLE transactions ADD COLUMN id_transaction TEXT')
 
+    user_columns = {
+        row['name'] for row in db.execute('PRAGMA table_info(users)').fetchall()
+    }
+    if 'base_currency' not in user_columns:
+        db.execute(f"ALTER TABLE users ADD COLUMN base_currency TEXT DEFAULT '{DEFAULT_BASE_CURRENCY}'")
+
     db.commit()
+
+
+def get_user_base_currency(user_id):
+    db = get_db()
+    row = db.execute(
+        'SELECT COALESCE(base_currency, ?) AS base_currency FROM users WHERE id = ?',
+        (DEFAULT_BASE_CURRENCY, user_id),
+    ).fetchone()
+    if not row:
+        return DEFAULT_BASE_CURRENCY
+    return normalize_currency(row['base_currency'])
+
+
+def fetch_ecb_rates_for_base(base_currency):
+    base_currency = normalize_currency(base_currency)
+    with urllib_request.urlopen(ECB_RATES_URL, timeout=8) as response:
+        xml_content = response.read()
+
+    root = ET.fromstring(xml_content)
+    cube_nodes = root.findall('.//{*}Cube[@currency][@rate]')
+
+    eur_pairs = {'EUR': 1.0}
+    for node in cube_nodes:
+        code = normalize_currency(node.attrib.get('currency'))
+        try:
+            eur_pairs[code] = float(node.attrib.get('rate'))
+        except (TypeError, ValueError):
+            continue
+
+    if base_currency not in eur_pairs:
+        raise ValueError(f'Missing ECB rate for base currency {base_currency}')
+
+    base_vs_eur = eur_pairs[base_currency]
+    rates = {}
+    for from_currency, eur_vs_from in eur_pairs.items():
+        if from_currency == base_currency:
+            rates[from_currency] = 1.0
+        else:
+            rates[from_currency] = base_vs_eur / eur_vs_from
+
+    return rates
+
+
+def ensure_daily_rates(db, base_currency):
+    base_currency = normalize_currency(base_currency)
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    has_today_rates = db.execute(
+        '''SELECT 1 FROM exchange_rates
+           WHERE to_currency = ? AND date(updated_at) = ?
+           LIMIT 1''',
+        (base_currency, today),
+    ).fetchone()
+    if has_today_rates:
+        return
+
+    try:
+        sync_rates_for_base(db, base_currency)
+    except Exception:
+        return
+
+
+def sync_rates_for_base(db, base_currency):
+    base_currency = normalize_currency(base_currency)
+    rates = fetch_ecb_rates_for_base(base_currency)
+    upserted = 0
+
+    for from_currency, rate in rates.items():
+        db.execute(
+            '''INSERT INTO exchange_rates (from_currency, to_currency, rate, provider, updated_at)
+               VALUES (?, ?, ?, 'ecb', CURRENT_TIMESTAMP)
+               ON CONFLICT(from_currency, to_currency)
+               DO UPDATE SET rate = excluded.rate, provider = excluded.provider, updated_at = CURRENT_TIMESTAMP''',
+            (from_currency, base_currency, rate),
+        )
+
+        upserted += 1
+
+    return upserted
+
+
+def get_conversion_rate(db, from_currency, to_currency):
+    from_currency = normalize_currency(from_currency)
+    to_currency = normalize_currency(to_currency)
+
+    if from_currency == to_currency:
+        return 1.0
+
+    direct = db.execute(
+        '''SELECT rate FROM exchange_rates
+           WHERE from_currency = ? AND to_currency = ?
+           ORDER BY updated_at DESC
+           LIMIT 1''',
+        (from_currency, to_currency),
+    ).fetchone()
+    if direct and direct['rate']:
+        return float(direct['rate'])
+
+    inverse = db.execute(
+        '''SELECT rate FROM exchange_rates
+           WHERE from_currency = ? AND to_currency = ?
+           ORDER BY updated_at DESC
+           LIMIT 1''',
+        (to_currency, from_currency),
+    ).fetchone()
+    if inverse and inverse['rate']:
+        try:
+            return 1.0 / float(inverse['rate'])
+        except ZeroDivisionError:
+            return None
+
+    return None
+
+
+def convert_amount(db, amount, from_currency, to_currency):
+    rate = get_conversion_rate(db, from_currency, to_currency)
+    if rate is None:
+        return float(amount)
+    return float(amount) * rate
+
+
+@app.route('/options')
+@login_required
+def options():
+    db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
+
+    rate_rows = db.execute(
+        '''SELECT from_currency, to_currency, rate, provider, updated_at
+           FROM exchange_rates
+           WHERE to_currency = ?
+           ORDER BY CASE WHEN from_currency = ? THEN 0 ELSE 1 END, from_currency ASC''',
+        (base_currency, base_currency),
+    ).fetchall()
+
+    if not any(row['from_currency'] == base_currency for row in rate_rows):
+        synthetic_row = {
+            'from_currency': base_currency,
+            'to_currency': base_currency,
+            'rate': 1.0,
+            'provider': 'system',
+            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        rate_rows = [synthetic_row] + list(rate_rows)
+
+    return render_template(
+        'options.html',
+        base_currency=base_currency,
+        rates=rate_rows,
+        currencies=sorted(SUPPORTED_CURRENCIES),
+    )
+
+
+@app.route('/options/base-currency', methods=['POST'])
+@login_required
+def set_base_currency():
+    db = get_db()
+    next_currency = normalize_currency(request.form.get('base_currency', DEFAULT_BASE_CURRENCY))
+
+    if next_currency not in SUPPORTED_CURRENCIES:
+        flash('Unsupported base currency.', 'danger')
+        return redirect(url_for('options'))
+
+    db.execute(
+        'UPDATE users SET base_currency = ? WHERE id = ?',
+        (next_currency, current_user.id),
+    )
+    db.commit()
+    flash(f'Base currency updated to {next_currency}.', 'success')
+    return redirect(url_for('options'))
+
+
+@app.route('/options/sync-rates', methods=['POST'])
+@login_required
+def sync_exchange_rates():
+    db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+
+    try:
+        upserted = sync_rates_for_base(db, base_currency)
+        db.commit()
+        flash(f'Synced {upserted} ECB exchange rates for {base_currency}.', 'success')
+    except Exception as exc:
+        flash(f'Failed to sync ECB rates: {exc}', 'danger')
+
+    return redirect(url_for('options'))
+
+
+@app.route('/options/rates/update', methods=['POST'])
+@login_required
+def update_exchange_rate():
+    db = get_db()
+    from_currency = normalize_currency(request.form.get('from_currency', ''))
+    to_currency = normalize_currency(request.form.get('to_currency', ''))
+    rate_raw = request.form.get('rate', '').strip()
+
+    if from_currency not in SUPPORTED_CURRENCIES or to_currency not in SUPPORTED_CURRENCIES:
+        flash('Unsupported currency code.', 'danger')
+        return redirect(url_for('options'))
+
+    try:
+        rate = float(rate_raw)
+        if rate <= 0:
+            raise ValueError
+    except ValueError:
+        flash('Rate must be a valid positive number.', 'danger')
+        return redirect(url_for('options'))
+
+    db.execute(
+        '''INSERT INTO exchange_rates (from_currency, to_currency, rate, provider, updated_at)
+           VALUES (?, ?, ?, 'manual', CURRENT_TIMESTAMP)
+           ON CONFLICT(from_currency, to_currency)
+           DO UPDATE SET rate = excluded.rate, provider = excluded.provider, updated_at = CURRENT_TIMESTAMP''',
+        (from_currency, to_currency, rate),
+    )
+    db.commit()
+    flash(f'Updated rate {from_currency} -> {to_currency}.', 'success')
+    return redirect(url_for('options'))
 
 
 def create_default_categories(user_id):
@@ -405,6 +675,8 @@ def health_check():
 @login_required
 def dashboard():
     db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
 
     # Get accounts with balances
     accounts = db.execute('''
@@ -418,12 +690,16 @@ def dashboard():
         GROUP BY a.id
     ''', (current_user.id,)).fetchall()
 
-    # Calculate total balance
-    total_balance = sum(acc['calculated_balance'] for acc in accounts)
+    # Calculate total balance in user base currency.
+    total_balance = sum(
+        convert_amount(db, acc['calculated_balance'], acc['currency'], base_currency)
+        for acc in accounts
+    )
 
     # Get recent transactions
     recent_transactions = db.execute('''
-        SELECT t.*, a.name as account_name, c.name as category_name, c.icon as category_icon
+         SELECT t.*, a.name as account_name, a.currency as account_currency,
+             c.name as category_name, c.icon as category_icon
         FROM transactions t
         JOIN accounts a ON t.account_id = a.id
         LEFT JOIN categories c ON t.category_id = c.id
@@ -432,38 +708,68 @@ def dashboard():
         LIMIT 10
     ''', (current_user.id,)).fetchall()
 
-    # Get monthly income and expenses
+    # Get monthly income and expenses converted to base currency.
     current_month = datetime.now().strftime('%Y-%m')
-    monthly_stats = db.execute('''
-        SELECT
-            COALESCE(SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE 0 END), 0) as income,
-            COALESCE(SUM(CASE WHEN transaction_type = 'expense' THEN amount ELSE 0 END), 0) as expenses
-        FROM transactions
-        WHERE user_id = ? AND strftime('%Y-%m', date) = ?
-    ''', (current_user.id, current_month)).fetchone()
+    monthly_rows = db.execute('''
+        SELECT t.amount, t.transaction_type, a.currency as account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ? AND strftime('%Y-%m', t.date) = ?
+    ''', (current_user.id, current_month)).fetchall()
+
+    monthly_income = 0.0
+    monthly_expenses = 0.0
+    for row in monthly_rows:
+        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
+        if row['transaction_type'] == 'income':
+            monthly_income += converted
+        elif row['transaction_type'] == 'expense':
+            monthly_expenses += converted
 
     # Get spending by category for current month
-    category_spending = db.execute('''
-        SELECT c.name, c.icon, c.color, COALESCE(SUM(t.amount), 0) as total
+    category_rows = db.execute('''
+        SELECT c.id, c.name, c.icon, c.color, t.amount, a.currency as account_currency
         FROM categories c
-        LEFT JOIN transactions t ON c.id = t.category_id
-            AND t.user_id = ?
-            AND t.transaction_type = 'expense'
-            AND strftime('%Y-%m', t.date) = ?
-        WHERE c.user_id = ? AND c.category_type = 'expense'
-        GROUP BY c.id
-        HAVING total > 0
-        ORDER BY total DESC
-        LIMIT 5
-    ''', (current_user.id, current_month, current_user.id)).fetchall()
+        JOIN transactions t ON c.id = t.category_id
+        JOIN accounts a ON t.account_id = a.id
+        WHERE c.user_id = ?
+          AND c.category_type = 'expense'
+          AND t.user_id = ?
+          AND t.transaction_type = 'expense'
+          AND strftime('%Y-%m', t.date) = ?
+    ''', (current_user.id, current_user.id, current_month)).fetchall()
+
+    category_totals = {}
+    for row in category_rows:
+        cat_id = row['id']
+        if cat_id not in category_totals:
+            category_totals[cat_id] = {
+                'name': row['name'],
+                'icon': row['icon'],
+                'color': row['color'],
+                'total': 0.0,
+            }
+        category_totals[cat_id]['total'] += convert_amount(
+            db,
+            row['amount'],
+            row['account_currency'],
+            base_currency,
+        )
+
+    category_spending = sorted(
+        [value for value in category_totals.values() if value['total'] > 0],
+        key=lambda item: item['total'],
+        reverse=True,
+    )[:5]
 
     return render_template('dashboard.html',
                          accounts=accounts,
                          total_balance=total_balance,
                          recent_transactions=recent_transactions,
-                         monthly_income=monthly_stats['income'],
-                         monthly_expenses=monthly_stats['expenses'],
-                         category_spending=category_spending)
+                         monthly_income=monthly_income,
+                         monthly_expenses=monthly_expenses,
+                         category_spending=category_spending,
+                         base_currency=base_currency)
 
 
 # Account routes
@@ -611,7 +917,8 @@ def transactions():
     search = request.args.get('search', '').strip()
 
     query = '''
-        SELECT t.*, a.name as account_name, c.name as category_name, c.icon as category_icon
+         SELECT t.*, a.name as account_name, a.currency as account_currency,
+             c.name as category_name, c.icon as category_icon
         FROM transactions t
         JOIN accounts a ON t.account_id = a.id
         LEFT JOIN categories c ON t.category_id = c.id
@@ -1173,7 +1480,7 @@ def clear_transactions():
 
     # Get uncategorized transactions
     transactions = db.execute('''
-        SELECT t.*, a.name as account_name
+        SELECT t.*, a.name as account_name, a.currency as account_currency
         FROM transactions t
         JOIN accounts a ON t.account_id = a.id
         WHERE t.user_id = ? AND t.category_id IS NULL
@@ -1571,6 +1878,8 @@ def create_rule_from_email(email_id):
 @login_required
 def budgets():
     db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
 
     # Get current month
     current_month = datetime.now().strftime('%Y-%m')
@@ -1584,30 +1893,50 @@ def budgets():
         ORDER BY month DESC
     ''', (current_user.id,)).fetchall()
 
-    # Get budgets with spending for selected month
+    # Get budget definitions.
     budgets = db.execute('''
-        SELECT b.*, c.name as category_name, c.icon as category_icon, c.color as category_color,
-               COALESCE(SUM(CASE WHEN strftime('%Y-%m', t.date) = ? THEN t.amount ELSE 0 END), 0) as spent
+        SELECT b.*, c.name as category_name, c.icon as category_icon, c.color as category_color
         FROM budgets b
         JOIN categories c ON b.category_id = c.id
-        LEFT JOIN transactions t ON t.category_id = b.category_id
-            AND t.user_id = b.user_id
-            AND t.transaction_type = 'expense'
         WHERE b.user_id = ?
-        GROUP BY b.id
         ORDER BY c.name
-    ''', (selected_month, current_user.id)).fetchall()
+    ''', (current_user.id,)).fetchall()
+
+    spending_rows = db.execute('''
+        SELECT t.category_id, t.amount, a.currency as account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ?
+          AND t.transaction_type = 'expense'
+          AND strftime('%Y-%m', t.date) = ?
+    ''', (current_user.id, selected_month)).fetchall()
+
+    spent_by_category = defaultdict(float)
+    for row in spending_rows:
+        spent_by_category[row['category_id']] += convert_amount(
+            db,
+            row['amount'],
+            row['account_currency'],
+            base_currency,
+        )
+
+    budget_items = []
+    for budget in budgets:
+        item = dict(budget)
+        item['spent'] = spent_by_category.get(budget['category_id'], 0.0)
+        budget_items.append(item)
 
     # Calculate totals
-    total_budget = sum(b['amount'] for b in budgets)
-    total_spent = sum(b['spent'] for b in budgets)
+    total_budget = sum(b['amount'] for b in budget_items)
+    total_spent = sum(b['spent'] for b in budget_items)
 
     return render_template('budgets.html',
-                         budgets=budgets,
+                         budgets=budget_items,
                          selected_month=selected_month,
                          available_months=available_months,
                          total_budget=total_budget,
-                         total_spent=total_spent)
+                         total_spent=total_spent,
+                         base_currency=base_currency)
 
 
 @app.route('/budgets/add', methods=['GET', 'POST'])
@@ -1698,6 +2027,8 @@ def delete_budget(budget_id):
 @login_required
 def reports():
     db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
 
     # Get date range (default: last 6 months)
     end_date = datetime.now()
@@ -1705,16 +2036,29 @@ def reports():
     if end_date.month <= 5:
         start_date = datetime(end_date.year - 1, start_date.month, 1)
 
-    # Monthly income vs expenses
-    monthly_data = db.execute('''
-        SELECT strftime('%Y-%m', date) as month,
-               SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE 0 END) as income,
-               SUM(CASE WHEN transaction_type = 'expense' THEN amount ELSE 0 END) as expenses
-        FROM transactions
-        WHERE user_id = ? AND date >= ?
-        GROUP BY month
+    monthly_rows = db.execute('''
+        SELECT strftime('%Y-%m', t.date) as month,
+               t.transaction_type,
+               t.amount,
+               a.currency as account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ? AND t.date >= ?
         ORDER BY month
     ''', (current_user.id, start_date.strftime('%Y-%m-%d'))).fetchall()
+
+    monthly_map = {}
+    for row in monthly_rows:
+        month = row['month']
+        if month not in monthly_map:
+            monthly_map[month] = {'month': month, 'income': 0.0, 'expenses': 0.0}
+        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
+        if row['transaction_type'] == 'income':
+            monthly_map[month]['income'] += converted
+        elif row['transaction_type'] == 'expense':
+            monthly_map[month]['expenses'] += converted
+
+    monthly_data = [monthly_map[key] for key in sorted(monthly_map.keys())]
 
     # Get selected month for category breakdown (default: current month)
     current_month = end_date.strftime('%Y-%m')
@@ -1728,32 +2072,60 @@ def reports():
         ORDER BY month DESC
     ''', (current_user.id,)).fetchall()
 
-    # Spending by category (selected month)
-    category_data = db.execute('''
-        SELECT c.name, c.color, SUM(t.amount) as total
+    category_rows = db.execute('''
+        SELECT c.id, c.name, c.color, t.amount, a.currency as account_currency
         FROM transactions t
         JOIN categories c ON t.category_id = c.id
+        JOIN accounts a ON t.account_id = a.id
         WHERE t.user_id = ? AND t.transaction_type = 'expense' AND strftime('%Y-%m', t.date) = ?
-        GROUP BY c.id
-        ORDER BY total DESC
     ''', (current_user.id, selected_month)).fetchall()
 
-    # Top payees
-    top_payees = db.execute('''
-        SELECT payee, SUM(amount) as total, COUNT(*) as count
-        FROM transactions
-        WHERE user_id = ? AND transaction_type = 'expense' AND payee != '' AND payee IS NOT NULL
-        GROUP BY payee
-        ORDER BY total DESC
-        LIMIT 10
+    category_map = {}
+    for row in category_rows:
+        cat_id = row['id']
+        if cat_id not in category_map:
+            category_map[cat_id] = {'name': row['name'], 'color': row['color'], 'total': 0.0}
+        category_map[cat_id]['total'] += convert_amount(
+            db,
+            row['amount'],
+            row['account_currency'],
+            base_currency,
+        )
+
+    category_data = sorted(category_map.values(), key=lambda item: item['total'], reverse=True)
+
+    payee_rows = db.execute('''
+        SELECT COALESCE(t.payee, '') as payee, t.amount, a.currency as account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ?
+          AND t.transaction_type = 'expense'
+          AND t.payee != ''
+          AND t.payee IS NOT NULL
     ''', (current_user.id,)).fetchall()
+
+    payee_map = {}
+    for row in payee_rows:
+        payee = row['payee']
+        if payee not in payee_map:
+            payee_map[payee] = {'payee': payee, 'total': 0.0, 'count': 0}
+        payee_map[payee]['total'] += convert_amount(
+            db,
+            row['amount'],
+            row['account_currency'],
+            base_currency,
+        )
+        payee_map[payee]['count'] += 1
+
+    top_payees = sorted(payee_map.values(), key=lambda item: item['total'], reverse=True)[:10]
 
     return render_template('reports.html',
                          monthly_data=monthly_data,
                          category_data=category_data,
                          top_payees=top_payees,
                          selected_month=selected_month,
-                         available_months=available_months)
+                         available_months=available_months,
+                         base_currency=base_currency)
 
 
 # API endpoints for charts
@@ -1762,19 +2134,34 @@ def reports():
 def api_monthly_data():
     db = get_db()
     months = request.args.get('months', 6, type=int)
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
 
-    data = db.execute('''
-        SELECT strftime('%Y-%m', date) as month,
-               SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE 0 END) as income,
-               SUM(CASE WHEN transaction_type = 'expense' THEN amount ELSE 0 END) as expenses
-        FROM transactions
-        WHERE user_id = ?
-        GROUP BY month
+    rows = db.execute('''
+        SELECT strftime('%Y-%m', t.date) as month,
+               t.transaction_type,
+               t.amount,
+               a.currency as account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ?
         ORDER BY month DESC
-        LIMIT ?
-    ''', (current_user.id, months)).fetchall()
+    ''', (current_user.id,)).fetchall()
 
-    return jsonify([dict(row) for row in reversed(data)])
+    monthly_map = {}
+    for row in rows:
+        month = row['month']
+        if month not in monthly_map:
+            monthly_map[month] = {'month': month, 'income': 0.0, 'expenses': 0.0}
+        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
+        if row['transaction_type'] == 'income':
+            monthly_map[month]['income'] += converted
+        elif row['transaction_type'] == 'expense':
+            monthly_map[month]['expenses'] += converted
+
+    ordered = [monthly_map[key] for key in sorted(monthly_map.keys(), reverse=True)[:months]]
+    ordered.reverse()
+    return jsonify(ordered)
 
 
 @app.route('/api/category-spending')
@@ -1782,17 +2169,31 @@ def api_monthly_data():
 def api_category_spending():
     db = get_db()
     month = request.args.get('month', datetime.now().strftime('%Y-%m'))
+    base_currency = get_user_base_currency(current_user.id)
+    ensure_daily_rates(db, base_currency)
 
-    data = db.execute('''
-        SELECT c.name, c.color, SUM(t.amount) as total
+    rows = db.execute('''
+        SELECT c.id, c.name, c.color, t.amount, a.currency as account_currency
         FROM transactions t
         JOIN categories c ON t.category_id = c.id
+        JOIN accounts a ON t.account_id = a.id
         WHERE t.user_id = ? AND t.transaction_type = 'expense' AND strftime('%Y-%m', t.date) = ?
-        GROUP BY c.id
-        ORDER BY total DESC
     ''', (current_user.id, month)).fetchall()
 
-    return jsonify([dict(row) for row in data])
+    category_map = {}
+    for row in rows:
+        cat_id = row['id']
+        if cat_id not in category_map:
+            category_map[cat_id] = {'name': row['name'], 'color': row['color'], 'total': 0.0}
+        category_map[cat_id]['total'] += convert_amount(
+            db,
+            row['amount'],
+            row['account_currency'],
+            base_currency,
+        )
+
+    data = sorted(category_map.values(), key=lambda item: item['total'], reverse=True)
+    return jsonify(data)
 
 
 # Initialize database on first request

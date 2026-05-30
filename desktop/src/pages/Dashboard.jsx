@@ -15,6 +15,7 @@ import {
   getDashboardStats,
   getMonthlyData,
   getRecentTransactions,
+  getBaseCurrency,
 } from "../api/tauri";
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
@@ -27,6 +28,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [monthly, setMonthly] = useState([]);
   const [recent, setRecent] = useState([]);
+  const [baseCurrency, setBaseCurrency] = useState("USD");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -34,11 +36,13 @@ export default function Dashboard() {
       getDashboardStats(),
       getMonthlyData(6),
       getRecentTransactions(10),
+      getBaseCurrency(),
     ])
-      .then(([s, m, r]) => {
+      .then(([s, m, r, bc]) => {
         setStats(s);
         setMonthly(m);
         setRecent(r);
+        setBaseCurrency(s?.base_currency || bc || "USD");
       })
       .catch((e) => setError(String(e)));
   }, []);
@@ -72,19 +76,19 @@ export default function Dashboard() {
           <StatCard
             icon="wallet2"
             label={t("dashboard.totalBalance")}
-            value={fmt(stats.total_balance)}
+            value={fmt(stats.total_balance, baseCurrency)}
             color="primary"
           />
           <StatCard
             icon="arrow-down-circle"
             label={t("dashboard.monthlyIncome")}
-            value={fmt(stats.monthly_income)}
+            value={fmt(stats.monthly_income, baseCurrency)}
             color="success"
           />
           <StatCard
             icon="arrow-up-circle"
             label={t("dashboard.monthlyExpenses")}
-            value={fmt(stats.monthly_expenses)}
+            value={fmt(stats.monthly_expenses, baseCurrency)}
             color="danger"
           />
           <StatCard
@@ -158,7 +162,7 @@ export default function Dashboard() {
                         }`}
                       >
                         {txn.transaction_type === "income" ? "+" : "−"}
-                        {fmt(txn.amount)}
+                        {fmt(txn.amount, txn.account_currency || "USD")}
                       </span>
                     </li>
                   ))}

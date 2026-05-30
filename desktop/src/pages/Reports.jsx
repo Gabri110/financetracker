@@ -6,11 +6,12 @@ import {
   CategoryScale, LinearScale, BarElement,
   ArcElement, Title, Tooltip, Legend,
 } from "chart.js";
-import { getMonthlyData, getCategorySpending, getTopPayees } from "../api/tauri";
+import { getMonthlyData, getCategorySpending, getTopPayees, getBaseCurrency } from "../api/tauri";
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Title, Tooltip, Legend);
 
-const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+const fmt = (n, currency = "USD") =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 export default function Reports() {
   const { t } = useTranslation();
@@ -19,6 +20,7 @@ export default function Reports() {
   const [topPayees, setTopPayees] = useState([]);
   const [period, setPeriod] = useState("this_month");
   const [months, setMonths] = useState(6);
+  const [baseCurrency, setBaseCurrency] = useState("USD");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -26,8 +28,14 @@ export default function Reports() {
       getMonthlyData(months),
       getCategorySpending(period),
       getTopPayees(10),
+      getBaseCurrency(),
     ])
-      .then(([m, c, p]) => { setMonthly(m); setCatSpending(c); setTopPayees(p); })
+      .then(([m, c, p, bc]) => {
+        setMonthly(m);
+        setCatSpending(c);
+        setTopPayees(p);
+        setBaseCurrency(bc || "USD");
+      })
       .catch((e) => setError(String(e)));
   }, [period, months]);
 
@@ -61,11 +69,11 @@ export default function Reports() {
       <div className="row g-3 mb-4">
         <div className="col-sm-4"><div className="card text-center p-3">
           <div className="text-muted small">{t("reports.totalIncome")}</div>
-          <div className="fs-4 fw-bold text-success">{fmt(totalIncome)}</div>
+          <div className="fs-4 fw-bold text-success">{fmt(totalIncome, baseCurrency)}</div>
         </div></div>
         <div className="col-sm-4"><div className="card text-center p-3">
           <div className="text-muted small">{t("reports.totalExpenses")}</div>
-          <div className="fs-4 fw-bold text-danger">{fmt(totalExpenses)}</div>
+          <div className="fs-4 fw-bold text-danger">{fmt(totalExpenses, baseCurrency)}</div>
         </div></div>
         <div className="col-sm-4"><div className="card text-center p-3">
           <div className="text-muted small">{t("reports.savingsRate")}</div>
@@ -134,7 +142,7 @@ export default function Reports() {
                     {topPayees.map((p, i) => (
                       <tr key={i}>
                         <td>{p.payee}</td>
-                        <td className="text-end text-danger">{fmt(p.total)}</td>
+                        <td className="text-end text-danger">{fmt(p.total, baseCurrency)}</td>
                         <td className="text-end text-muted">{p.count}</td>
                       </tr>
                     ))}

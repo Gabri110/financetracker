@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { getTransactions, updateTransaction, getCategories } from "../api/tauri";
 
-const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+const fmt = (n, currency = "USD") =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 export default function Clear() {
   const { t } = useTranslation();
@@ -119,7 +120,7 @@ export default function Clear() {
             </div>
             <div className="col-auto">
               <span className={`fs-2 fw-bold ${current.transaction_type === "income" ? "text-success" : "text-danger"}`}>
-                {current.transaction_type === "income" ? "+" : "−"}{fmt(current.amount)}
+                {current.transaction_type === "income" ? "+" : "−"}{fmt(current.amount, current.account_currency || "USD")}
               </span>
             </div>
           </div>

@@ -8,6 +8,7 @@ pub struct Transaction {
     pub id: i64,
     pub account_id: i64,
     pub account_name: Option<String>,
+    pub account_currency: Option<String>,
     pub category_id: Option<i64>,
     pub category_name: Option<String>,
     pub category_color: Option<String>,
@@ -48,7 +49,7 @@ pub fn get_transactions(
     let conn = guard.as_ref().ok_or("No database open")?;
 
     let mut sql = String::from(
-        "SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, c.icon,
+        "SELECT t.id, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
                 t.transaction_type, t.amount, t.description, t.payee, t.date, t.created_at
          FROM transactions t
          LEFT JOIN accounts a ON t.account_id = a.id
@@ -107,16 +108,17 @@ pub fn get_transactions(
                 id: row.get(0)?,
                 account_id: row.get(1)?,
                 account_name: row.get(2)?,
-                category_id: row.get(3)?,
-                category_name: row.get(4)?,
-                category_color: row.get(5)?,
-                category_icon: row.get(6)?,
-                transaction_type: row.get(7)?,
-                amount: row.get(8)?,
-                description: row.get(9)?,
-                payee: row.get(10)?,
-                date: row.get(11)?,
-                created_at: row.get(12)?,
+                account_currency: row.get(3)?,
+                category_id: row.get(4)?,
+                category_name: row.get(5)?,
+                category_color: row.get(6)?,
+                category_icon: row.get(7)?,
+                transaction_type: row.get(8)?,
+                amount: row.get(9)?,
+                description: row.get(10)?,
+                payee: row.get(11)?,
+                date: row.get(12)?,
+                created_at: row.get(13)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -388,7 +390,7 @@ fn normalize_date(raw: &str, format: &str) -> Option<String> {
 
 fn fetch_transaction(conn: &rusqlite::Connection, id: i64) -> Result<Transaction, String> {
     conn.query_row(
-        "SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, c.icon,
+    "SELECT t.id, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
                 t.transaction_type, t.amount, t.description, t.payee, t.date, t.created_at
          FROM transactions t
          LEFT JOIN accounts a ON t.account_id = a.id
@@ -400,16 +402,17 @@ fn fetch_transaction(conn: &rusqlite::Connection, id: i64) -> Result<Transaction
                 id: row.get(0)?,
                 account_id: row.get(1)?,
                 account_name: row.get(2)?,
-                category_id: row.get(3)?,
-                category_name: row.get(4)?,
-                category_color: row.get(5)?,
-                category_icon: row.get(6)?,
-                transaction_type: row.get(7)?,
-                amount: row.get(8)?,
-                description: row.get(9)?,
-                payee: row.get(10)?,
-                date: row.get(11)?,
-                created_at: row.get(12)?,
+                account_currency: row.get(3)?,
+                category_id: row.get(4)?,
+                category_name: row.get(5)?,
+                category_color: row.get(6)?,
+                category_icon: row.get(7)?,
+                transaction_type: row.get(8)?,
+                amount: row.get(9)?,
+                description: row.get(10)?,
+                payee: row.get(11)?,
+                date: row.get(12)?,
+                created_at: row.get(13)?,
             })
         },
     )

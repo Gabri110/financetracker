@@ -23,3 +23,4 @@ thiserror = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

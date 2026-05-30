@@ -6,7 +6,8 @@ import {
 } from "../api/tauri";
 import Alert from "../components/Alert";
 
-const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+const fmt = (n, currency = "USD") =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 const today = () => new Date().toISOString().slice(0, 10);
 
 const emptyForm = {
@@ -244,7 +245,7 @@ export default function Transactions() {
                       )}
                     </td>
                     <td className={`text-end fw-semibold ${txn.transaction_type === "income" ? "text-success" : "text-danger"}`}>
-                      {txn.transaction_type === "income" ? "+" : "−"}{fmt(txn.amount)}
+                      {txn.transaction_type === "income" ? "+" : "−"}{fmt(txn.amount, txn.account_currency || "USD")}
                     </td>
                     <td className="text-nowrap">
                       <button className="btn btn-sm btn-outline-secondary me-1" onClick={() => openEdit(txn)}>

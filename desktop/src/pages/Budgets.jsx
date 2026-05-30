@@ -4,7 +4,8 @@ import { getBudgets, addBudget, updateBudget, deleteBudget, getCategories } from
 import Alert from "../components/Alert";
 
 const today = () => new Date().toISOString().slice(0, 10);
-const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+const fmt = (n, currency = "USD") =>
+  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 const empty = { category_id: "", amount: "", period: "monthly", start_date: today() };
 
 export default function Budgets() {
@@ -138,15 +139,17 @@ export default function Budgets() {
                     </div>
                   </div>
                   <div className="d-flex justify-content-between mb-1">
-                    <span className={`fw-semibold ${over ? "text-danger" : ""}`}>{fmt(b.spent)} {t("common.spent")}</span>
-                    <span className="text-muted">{t("common.of")} {fmt(b.amount)}</span>
+                    <span className={`fw-semibold ${over ? "text-danger" : ""}`}>{fmt(b.spent, b.currency || "USD")} {t("common.spent")}</span>
+                    <span className="text-muted">{t("common.of")} {fmt(b.amount, b.currency || "USD")}</span>
                   </div>
                   <div className="progress" style={{ height: 8 }}>
                     <div className={`progress-bar ${over ? "bg-danger" : pct > 80 ? "bg-warning" : "bg-success"}`}
                       style={{ width: `${pct}%` }} />
                   </div>
                   <small className={`${over ? "text-danger" : "text-muted"} mt-1 d-block`}>
-                    {over ? t("budgets.overBudget", { amount: fmt(b.spent - b.amount) }) : t("budgets.remaining", { amount: fmt(b.amount - b.spent) })}
+                    {over
+                      ? t("budgets.overBudget", { amount: fmt(b.spent - b.amount, b.currency || "USD") })
+                      : t("budgets.remaining", { amount: fmt(b.amount - b.spent, b.currency || "USD") })}
                   </small>
                 </div>
               </div>

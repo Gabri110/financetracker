@@ -4,6 +4,28 @@ A fully offline desktop finance tracker built with Tauri v2, React, and Rust. No
 
 - Platforms: Windows, macOS, Linux
 - Languages: English, Portuguese (Brazil), Spanish
+- Multi-currency: account-native currencies with converted aggregate totals
+
+## Currency and Exchange Rates
+
+The desktop app supports mixed-currency accounts and converts aggregates to a configurable base currency.
+
+- Per-account and per-transaction amounts are shown in each account's currency.
+- Dashboard, reports, and budgets are converted to the configured base currency.
+- The app can auto-refresh rates daily from ECB data.
+- You can manually insert or override any `from -> to` exchange rate in **Options**.
+
+### Desktop Options Workflow
+
+1. Open **Options** from the sidebar.
+2. Set the **Base Currency**.
+3. Click **Sync Now** to fetch ECB rates immediately.
+4. Edit existing rates or add new overrides manually.
+
+Notes:
+- ECB sync depends on internet connectivity at sync time.
+- Manual rates are persisted locally in the selected SQLite database.
+- If a rate is unavailable, the app falls back to original amount values for display safety.
 
 ## Prerequisites
 

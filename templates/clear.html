@@ -89,7 +89,7 @@
                         </div>
                         <div class="col-md-3 text-end">
                             <strong class="{% if trans.transaction_type == 'income' %}amount-income{% else %}amount-expense{% endif %}">
-                                {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}${{ "{:,.2f}".format(trans.amount) }}
+                                {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}{{ format_currency(trans.amount, trans.account_currency) }}
                             </strong>
                         </div>
                     </div>

@@ -118,7 +118,7 @@
                         </span>
                         <br>
                         <strong class="{% if trans.transaction_type == 'income' %}transaction-income{% else %}transaction-expense{% endif %}">
-                            {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}${{ "{:,.2f}".format(trans.amount) }}
+                            {% if trans.transaction_type == 'income' %}+{% else %}-{% endif %}{{ format_currency(trans.amount, trans.account_currency) }}
                         </strong>
                     </td>
                     <td class="text-end">

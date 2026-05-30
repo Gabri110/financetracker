@@ -1,4 +1,9 @@
 use crate::AppState;
+use crate::commands::fx::{
+    convert_amount_from_conn,
+    ensure_daily_rates_from_conn,
+    get_base_currency_from_conn,
+};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +18,7 @@ pub struct Budget {
     pub period: String,
     pub start_date: String,
     pub spent: f64,
+    pub currency: String,
     pub created_at: String,
 }
 
@@ -21,28 +27,26 @@ pub fn get_budgets(state: tauri::State<AppState>) -> Result<Vec<Budget>, String>
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
 
+    ensure_daily_rates_from_conn(conn)?;
+
     // Get current month range for spending calculation
     let now = chrono::Local::now();
     let month_start = format!("{}-{:02}-01", now.format("%Y"), now.format("%m"));
     let month_end = format!("{}-{:02}-31", now.format("%Y"), now.format("%m"));
 
+    let base_currency = get_base_currency_from_conn(conn)?;
+
     let mut stmt = conn
         .prepare(
-            "SELECT b.id, b.category_id, c.name, c.color, c.icon, b.amount, b.period, b.start_date, b.created_at,
-                    COALESCE((
-                        SELECT SUM(t.amount) FROM transactions t
-                        WHERE t.category_id = b.category_id
-                          AND t.transaction_type = 'expense'
-                          AND t.date BETWEEN ?1 AND ?2
-                    ), 0) as spent
+            "SELECT b.id, b.category_id, c.name, c.color, c.icon, b.amount, b.period, b.start_date, b.created_at
              FROM budgets b
              LEFT JOIN categories c ON b.category_id = c.id
              ORDER BY c.name",
         )
         .map_err(|e| e.to_string())?;
 
-    let budgets = stmt
-        .query_map(params![month_start, month_end], |row| {
+    let mut budgets = stmt
+        .query_map([], |row| {
             Ok(Budget {
                 id: row.get(0)?,
                 category_id: row.get(1)?,
@@ -53,12 +57,45 @@ pub fn get_budgets(state: tauri::State<AppState>) -> Result<Vec<Budget>, String>
                 period: row.get(6)?,
                 start_date: row.get(7)?,
                 created_at: row.get(8)?,
-                spent: row.get(9)?,
+                spent: 0.0,
+                currency: base_currency.clone(),
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+
+    let mut spend_stmt = conn
+        .prepare(
+            "SELECT category_id, amount, a.currency
+             FROM transactions t
+             JOIN accounts a ON t.account_id = a.id
+             WHERE t.transaction_type = 'expense'
+               AND t.date BETWEEN ?1 AND ?2",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let spend_rows = spend_stmt
+        .query_map(params![month_start, month_end], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut spent_by_category = std::collections::HashMap::<i64, f64>::new();
+    for (category_id, amount, currency) in spend_rows {
+        let converted = convert_amount_from_conn(conn, amount, &currency, &base_currency);
+        *spent_by_category.entry(category_id).or_insert(0.0) += converted;
+    }
+
+    for budget in &mut budgets {
+        budget.spent = spent_by_category.get(&budget.category_id).copied().unwrap_or(0.0);
+    }
 
     Ok(budgets)
 }
@@ -133,6 +170,7 @@ fn fetch_budget(conn: &rusqlite::Connection, id: i64) -> Result<Budget, String> 
                 start_date: row.get(7)?,
                 created_at: row.get(8)?,
                 spent: row.get(9)?,
+                currency: get_base_currency_from_conn(conn).unwrap_or_else(|_| "USD".to_string()),
             })
         },
     )

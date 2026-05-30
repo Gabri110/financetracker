@@ -291,6 +291,11 @@
                                 <i class="bi bi-bar-chart"></i> Reports
                             </a>
                         </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.endpoint in ['options', 'set_base_currency', 'sync_exchange_rates', 'update_exchange_rate'] %}active{% endif %}" href="{{ url_for('options') }}">
+                                <i class="bi bi-sliders"></i> Options
+                            </a>
+                        </li>
                     </ul>
                 </div>
             </nav>

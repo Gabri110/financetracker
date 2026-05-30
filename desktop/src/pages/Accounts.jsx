@@ -1,6 +1,14 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { getAccounts, addAccount, updateAccount, adjustAccountBalance, deleteAccount } from "../api/tauri";
+import {
+  getAccounts,
+  addAccount,
+  updateAccount,
+  adjustAccountBalance,
+  deleteAccount,
+  getBaseCurrency,
+  setBaseCurrency,
+} from "../api/tauri";
 import Alert from "../components/Alert";
 
 const ACCOUNT_TYPES = ["checking", "savings", "credit", "cash", "investment", "other"];
@@ -21,9 +29,26 @@ export default function Accounts() {
   const [alert, setAlert] = useState({ type: "", msg: "" });
   const [deleting, setDeleting] = useState(null);
   const [adjustment, setAdjustment] = useState(emptyAdjustment);
+  const [baseCurrency, setBaseCurrencyState] = useState("USD");
 
-  const load = () => getAccounts().then(setAccounts).catch((e) => setAlert({ type: "danger", msg: String(e) }));
+  const load = () =>
+    Promise.all([getAccounts(), getBaseCurrency()])
+      .then(([accountRows, base]) => {
+        setAccounts(accountRows);
+        setBaseCurrencyState(base || "USD");
+      })
+      .catch((e) => setAlert({ type: "danger", msg: String(e) }));
   useEffect(() => { load(); }, []);
+
+  const handleBaseCurrencyChange = async (currency) => {
+    try {
+      const saved = await setBaseCurrency(currency);
+      setBaseCurrencyState(saved);
+      setAlert({ type: "success", msg: `Base currency set to ${saved}` });
+    } catch (e) {
+      setAlert({ type: "danger", msg: String(e) });
+    }
+  };
 
   const openAdd = () => {
     setForm(empty);
@@ -79,9 +104,20 @@ export default function Accounts() {
     <div>
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h4 className="fw-bold mb-0">{t("accounts.title")}</h4>
-        <button className="btn btn-primary" onClick={openAdd}>
-          <i className="bi bi-plus-lg me-1" /> {t("accounts.addAccount")}
-        </button>
+        <div className="d-flex gap-2 align-items-center">
+          <select
+            className="form-select form-select-sm"
+            style={{ width: 120 }}
+            value={baseCurrency}
+            onChange={(e) => handleBaseCurrencyChange(e.target.value)}
+            title="Base currency for converted totals"
+          >
+            {CURRENCIES.map((c) => <option key={c}>{c}</option>)}
+          </select>
+          <button className="btn btn-primary" onClick={openAdd}>
+            <i className="bi bi-plus-lg me-1" /> {t("accounts.addAccount")}
+          </button>
+        </div>
       </div>
 
       <Alert type={alert.type} message={alert.msg} onDismiss={() => setAlert({ type: "", msg: "" })} />

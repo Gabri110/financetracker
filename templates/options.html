@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title %}Options - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <h1><i class="bi bi-gear"></i> Options</h1>
+    <form method="POST" action="{{ url_for('sync_exchange_rates') }}">
+        <button type="submit" class="btn btn-outline-primary">
+            <i class="bi bi-cloud-download"></i> Sync ECB Rates Now
+        </button>
+    </form>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-currency-exchange"></i> Base Currency
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('set_base_currency') }}" class="row g-3 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label">Base Currency for Aggregates</label>
+                <select name="base_currency" class="form-select" required>
+                    {% for currency in currencies %}
+                    <option value="{{ currency }}" {% if currency == base_currency %}selected{% endif %}>{{ currency }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-4">
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-check-lg"></i> Save Base Currency
+                </button>
+            </div>
+            <div class="col-12 text-muted small">
+                Dashboard, reports, and budgets use this base currency for converted totals.
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-plus-circle"></i> Add / Override Rate Manually
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('update_exchange_rate') }}" class="row g-3 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label">From</label>
+                <select name="from_currency" class="form-select" required>
+                    {% for currency in currencies %}
+                    <option value="{{ currency }}">{{ currency }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">To</label>
+                <select name="to_currency" class="form-select" required>
+                    {% for currency in currencies %}
+                    <option value="{{ currency }}" {% if currency == base_currency %}selected{% endif %}>{{ currency }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">Rate</label>
+                <input type="number" class="form-control" name="rate" step="0.000001" min="0.000001" required>
+            </div>
+            <div class="col-md-3">
+                <button type="submit" class="btn btn-primary w-100">
+                    <i class="bi bi-save"></i> Save Rate
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-table"></i> Exchange Rates (to {{ base_currency }})</span>
+        <small class="text-muted">{{ rates|length }} rates</small>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Rate</th>
+                    <th>Provider</th>
+                    <th>Updated At</th>
+                    <th>Manual Update</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if rates %}
+                    {% for row in rates %}
+                    <tr>
+                        <td class="fw-semibold">{{ row.from_currency }}</td>
+                        <td>{{ row.to_currency }}</td>
+                        <td>{{ "{:.6f}".format(row.rate) }}</td>
+                        <td><span class="badge bg-secondary text-uppercase">{{ row.provider }}</span></td>
+                        <td class="text-muted">{{ row.updated_at }}</td>
+                        <td>
+                            {% if row.from_currency == row.to_currency %}
+                            <small class="text-muted">Fixed 1:1</small>
+                            {% else %}
+                            <form method="POST" action="{{ url_for('update_exchange_rate') }}" class="d-flex gap-2">
+                                <input type="hidden" name="from_currency" value="{{ row.from_currency }}">
+                                <input type="hidden" name="to_currency" value="{{ row.to_currency }}">
+                                <input type="number"
+                                       class="form-control form-control-sm"
+                                       style="max-width: 130px;"
+                                       name="rate"
+                                       step="0.000001"
+                                       min="0.000001"
+                                       value="{{ "{:.6f}".format(row.rate) }}"
+                                       required>
+                                <button type="submit" class="btn btn-sm btn-outline-primary">
+                                    Save
+                                </button>
+                            </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr>
+                        <td colspan="6" class="text-center text-muted py-4">No rates found.</td>
+                    </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

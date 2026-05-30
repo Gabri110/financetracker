@@ -114,6 +114,12 @@ pub fn run() {
             commands::rules::update_rule,
             commands::rules::delete_rule,
             commands::rules::auto_categorize,
+            // FX / settings
+            commands::fx::get_base_currency,
+            commands::fx::set_base_currency,
+            commands::fx::sync_ecb_rates,
+            commands::fx::get_exchange_rates,
+            commands::fx::set_exchange_rate,
             // Reports
             commands::reports::get_dashboard_stats,
             commands::reports::get_monthly_data,

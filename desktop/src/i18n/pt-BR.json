@@ -46,6 +46,7 @@
     "budgets": "Or\u00e7amentos",
     "reports": "Relat\u00f3rios",
     "importCsv": "Importar CSV",
+    "options": "Op\u00e7\u00f5es",
     "switchDatabase": "Trocar Banco de Dados"
   },
   "welcome": {
@@ -211,5 +212,18 @@
     "skip": "Pular",
     "nextJ": "(J)",
     "keyHint": "Pressione 1\u20139 para categorizar instantaneamente"
+  },
+  "options": {
+    "title": "Op\u00e7\u00f5es",
+    "baseCurrency": "Moeda base",
+    "syncNow": "Sincronizar taxas do ECB agora",
+    "autoSyncHint": "As taxas s\u00e3o atualizadas diariamente ao abrir relat\u00f3rios e or\u00e7amentos. Voc\u00ea tamb\u00e9m pode sobrescrever manualmente qualquer taxa abaixo.",
+    "rates": "Taxas de c\u00e2mbio",
+    "fromCurrency": "De",
+    "toCurrency": "Para",
+    "rate": "Taxa",
+    "provider": "Provedor",
+    "updatedAt": "Atualizado",
+    "invalidRate": "A taxa deve ser um n\u00famero positivo."
   }
 }
