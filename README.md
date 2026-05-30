@@ -149,6 +149,27 @@ financetracker/
    - Delimiter (comma, semicolon, tab)
    - If `ID_TRANSACTION` is present and already imported, the new row replaces the previous transaction data
 
+### Exporting and Restoring Data
+
+You can now export and reimport the main finance datasets:
+
+- **Transactions** (including per-account data)
+- **Categories**
+- **Rules**
+- **Full backup** as:
+   - ZIP package with multiple CSV files
+   - Excel workbook (`.xlsx`) with multiple sheets
+
+Web app flow:
+1. Go to **Import** in the sidebar (now also contains export and restore actions).
+2. Use quick export buttons for individual CSV datasets or full ZIP/XLSX backup.
+3. Use restore actions to import categories, rules, or a full ZIP/XLSX package.
+
+Merge behavior:
+- Default restore mode is **merge/upsert**.
+- Transactions use `ID_TRANSACTION` when available.
+- If `ID_TRANSACTION` is missing, the importer generates a deterministic fallback ID so repeated imports stay idempotent.
+
 ### Setting Up Email Forwarding
 
 1. Go to **Email** in the sidebar

@@ -2,10 +2,12 @@ use crate::AppState;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
     pub id: i64,
+    pub id_transaction: Option<String>,
     pub account_id: i64,
     pub account_name: Option<String>,
     pub account_currency: Option<String>,
@@ -36,8 +38,28 @@ pub struct TransactionFilter {
 #[derive(Debug, Serialize)]
 pub struct ImportResult {
     pub imported: usize,
+    pub updated: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
+}
+
+fn fallback_transaction_id(
+    account_name: &str,
+    account_currency: &str,
+    date: &str,
+    amount: f64,
+    description: &str,
+    payee: &str,
+) -> String {
+    format!(
+        "auto|{}|{}|{}|{:.2}|{}|{}",
+        account_name.trim().to_lowercase(),
+        account_currency.trim().to_uppercase(),
+        date.trim(),
+        amount.abs(),
+        description.trim().to_lowercase(),
+        payee.trim().to_lowercase(),
+    )
 }
 
 #[tauri::command]
@@ -49,7 +71,7 @@ pub fn get_transactions(
     let conn = guard.as_ref().ok_or("No database open")?;
 
     let mut sql = String::from(
-        "SELECT t.id, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
+        "SELECT t.id, t.id_transaction, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
                 t.transaction_type, t.amount, t.description, t.payee, t.date, t.created_at
          FROM transactions t
          LEFT JOIN accounts a ON t.account_id = a.id
@@ -106,19 +128,20 @@ pub fn get_transactions(
         .query_map([], |row| {
             Ok(Transaction {
                 id: row.get(0)?,
-                account_id: row.get(1)?,
-                account_name: row.get(2)?,
-                account_currency: row.get(3)?,
-                category_id: row.get(4)?,
-                category_name: row.get(5)?,
-                category_color: row.get(6)?,
-                category_icon: row.get(7)?,
-                transaction_type: row.get(8)?,
-                amount: row.get(9)?,
-                description: row.get(10)?,
-                payee: row.get(11)?,
-                date: row.get(12)?,
-                created_at: row.get(13)?,
+                id_transaction: row.get(1)?,
+                account_id: row.get(2)?,
+                account_name: row.get(3)?,
+                account_currency: row.get(4)?,
+                category_id: row.get(5)?,
+                category_name: row.get(6)?,
+                category_color: row.get(7)?,
+                category_icon: row.get(8)?,
+                transaction_type: row.get(9)?,
+                amount: row.get(10)?,
+                description: row.get(11)?,
+                payee: row.get(12)?,
+                date: row.get(13)?,
+                created_at: row.get(14)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -372,7 +395,277 @@ pub fn import_csv(
         imported += 1;
     }
 
-    Ok(ImportResult { imported, skipped, errors })
+    Ok(ImportResult {
+        imported,
+        updated: 0,
+        skipped,
+        errors,
+    })
+}
+
+#[tauri::command]
+pub fn export_transactions_csv(
+    state: tauri::State<AppState>,
+    filter: Option<TransactionFilter>,
+) -> Result<String, String> {
+    let transactions = get_transactions(state, filter)?;
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer
+        .write_record([
+            "ID_TRANSACTION",
+            "DATE",
+            "AMOUNT",
+            "CATEGORY",
+            "DESCRIPTION",
+            "PAYEE",
+            "ACCOUNT_NAME",
+            "ACCOUNT_CURRENCY",
+            "TRANSACTION_TYPE",
+        ])
+        .map_err(|e| e.to_string())?;
+
+    for tx in transactions {
+        let sign_amount = if tx.transaction_type == "expense" {
+            -tx.amount
+        } else {
+            tx.amount
+        };
+        writer
+            .write_record([
+                tx.id_transaction.unwrap_or_default(),
+                tx.date,
+                format!("{:.2}", sign_amount),
+                tx.category_name.unwrap_or_default(),
+                tx.description.unwrap_or_default(),
+                tx.payee.unwrap_or_default(),
+                tx.account_name.unwrap_or_default(),
+                tx.account_currency.unwrap_or_else(|| "USD".to_string()),
+                tx.transaction_type,
+            ])
+            .map_err(|e| e.to_string())?;
+    }
+
+    writer.flush().map_err(|e| e.to_string())?;
+    let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn import_transactions_canonical_csv(
+    state: tauri::State<AppState>,
+    csv_content: String,
+) -> Result<ImportResult, String> {
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_ref().ok_or("No database open")?;
+
+    let mut category_map: HashMap<String, i64> = HashMap::new();
+    let mut cat_stmt = conn
+        .prepare("SELECT id, name FROM categories")
+        .map_err(|e| e.to_string())?;
+    let cat_rows = cat_stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in cat_rows {
+        let (id, name) = row.map_err(|e| e.to_string())?;
+        category_map.insert(name.trim().to_lowercase(), id);
+    }
+
+    let mut account_map: HashMap<String, i64> = HashMap::new();
+    let mut acc_stmt = conn
+        .prepare("SELECT id, name, currency FROM accounts")
+        .map_err(|e| e.to_string())?;
+    let acc_rows = acc_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in acc_rows {
+        let (id, name, currency) = row.map_err(|e| e.to_string())?;
+        account_map.insert(
+            format!("{}||{}", name.trim().to_lowercase(), currency.trim().to_uppercase()),
+            id,
+        );
+    }
+
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_content.as_bytes());
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+
+    let idx = |name: &str| {
+        headers
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(name))
+    };
+
+    let id_idx = idx("ID_TRANSACTION");
+    let date_idx = idx("DATE").ok_or("Missing DATE column")?;
+    let amount_idx = idx("AMOUNT").ok_or("Missing AMOUNT column")?;
+    let category_idx = idx("CATEGORY");
+    let description_idx = idx("DESCRIPTION");
+    let payee_idx = idx("PAYEE");
+    let account_name_idx = idx("ACCOUNT_NAME").ok_or("Missing ACCOUNT_NAME column")?;
+    let account_currency_idx = idx("ACCOUNT_CURRENCY");
+    let type_idx = idx("TRANSACTION_TYPE");
+
+    let mut imported = 0;
+    let mut updated = 0;
+    let mut skipped = 0;
+    let mut errors: Vec<String> = Vec::new();
+    let mut touched_accounts: HashSet<i64> = HashSet::new();
+
+    for (row_num, result) in reader.records().enumerate() {
+        let record = match result {
+            Ok(r) => r,
+            Err(e) => {
+                skipped += 1;
+                errors.push(format!("Row {}: {}", row_num + 2, e));
+                continue;
+            }
+        };
+
+        let account_name = record.get(account_name_idx).unwrap_or("").trim().to_string();
+        if account_name.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let account_currency = account_currency_idx
+            .and_then(|i| record.get(i))
+            .unwrap_or("USD")
+            .trim()
+            .to_uppercase();
+        let account_key = format!("{}||{}", account_name.to_lowercase(), account_currency);
+        let account_id = if let Some(id) = account_map.get(&account_key).copied() {
+            id
+        } else {
+            conn.execute(
+                "INSERT INTO accounts (name, account_type, balance, currency) VALUES (?1, 'checking', 0, ?2)",
+                params![account_name, account_currency],
+            )
+            .map_err(|e| e.to_string())?;
+            let id = conn.last_insert_rowid();
+            account_map.insert(account_key, id);
+            id
+        };
+
+        let date = record.get(date_idx).unwrap_or("").trim().to_string();
+        let parsed_amount = record
+            .get(amount_idx)
+            .unwrap_or("0")
+            .trim()
+            .replace(',', ".")
+            .parse::<f64>();
+
+        let amount = match parsed_amount {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                errors.push(format!("Row {}: invalid amount", row_num + 2));
+                continue;
+            }
+        };
+
+        let mut transaction_type = type_idx
+            .and_then(|i| record.get(i))
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !["income", "expense", "transfer"].contains(&transaction_type.as_str()) {
+            transaction_type = if amount < 0.0 {
+                "expense".to_string()
+            } else {
+                "income".to_string()
+            };
+        }
+
+        let normalized_amount = amount.abs();
+        let description = description_idx
+            .and_then(|i| record.get(i))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let payee = payee_idx
+            .and_then(|i| record.get(i))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let category_id = category_idx
+            .and_then(|i| record.get(i))
+            .map(|v| v.trim().to_lowercase())
+            .and_then(|v| category_map.get(&v).copied());
+
+        let id_transaction = id_idx
+            .and_then(|i| record.get(i))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let stable_id = if id_transaction.is_empty() {
+            fallback_transaction_id(
+                &account_name,
+                &account_currency,
+                &date,
+                normalized_amount,
+                &description,
+                &payee,
+            )
+        } else {
+            id_transaction
+        };
+
+        let existing = conn
+            .query_row(
+                "SELECT id FROM transactions WHERE account_id = ?1 AND id_transaction = ?2 ORDER BY id DESC LIMIT 1",
+                params![account_id, stable_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
+
+        if let Some(tx_id) = existing {
+            conn.execute(
+                "UPDATE transactions SET category_id = ?1, transaction_type = ?2, amount = ?3, description = ?4, payee = ?5, date = ?6 WHERE id = ?7",
+                params![category_id, transaction_type, normalized_amount, description, payee, date, tx_id],
+            )
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+            touched_accounts.insert(account_id);
+        } else {
+            conn.execute(
+                "INSERT INTO transactions (account_id, category_id, transaction_type, amount, description, payee, date, id_transaction) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![account_id, category_id, transaction_type, normalized_amount, description, payee, date, stable_id],
+            )
+            .map_err(|e| e.to_string())?;
+            imported += 1;
+            touched_accounts.insert(account_id);
+        }
+    }
+
+    for account_id in touched_accounts {
+        let recalculated_balance: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(CASE WHEN transaction_type='income' THEN amount WHEN transaction_type='expense' THEN -amount ELSE 0 END), 0) FROM transactions WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+
+        conn.execute(
+            "UPDATE accounts SET balance = ?1 WHERE id = ?2",
+            params![recalculated_balance, account_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(ImportResult {
+        imported,
+        updated,
+        skipped,
+        errors,
+    })
 }
 
 fn normalize_date(raw: &str, format: &str) -> Option<String> {
@@ -390,7 +683,7 @@ fn normalize_date(raw: &str, format: &str) -> Option<String> {
 
 fn fetch_transaction(conn: &rusqlite::Connection, id: i64) -> Result<Transaction, String> {
     conn.query_row(
-    "SELECT t.id, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
+    "SELECT t.id, t.id_transaction, t.account_id, a.name, a.currency, t.category_id, c.name, c.color, c.icon,
                 t.transaction_type, t.amount, t.description, t.payee, t.date, t.created_at
          FROM transactions t
          LEFT JOIN accounts a ON t.account_id = a.id
@@ -400,19 +693,20 @@ fn fetch_transaction(conn: &rusqlite::Connection, id: i64) -> Result<Transaction
         |row| {
             Ok(Transaction {
                 id: row.get(0)?,
-                account_id: row.get(1)?,
-                account_name: row.get(2)?,
-                account_currency: row.get(3)?,
-                category_id: row.get(4)?,
-                category_name: row.get(5)?,
-                category_color: row.get(6)?,
-                category_icon: row.get(7)?,
-                transaction_type: row.get(8)?,
-                amount: row.get(9)?,
-                description: row.get(10)?,
-                payee: row.get(11)?,
-                date: row.get(12)?,
-                created_at: row.get(13)?,
+                id_transaction: row.get(1)?,
+                account_id: row.get(2)?,
+                account_name: row.get(3)?,
+                account_currency: row.get(4)?,
+                category_id: row.get(5)?,
+                category_name: row.get(6)?,
+                category_color: row.get(7)?,
+                category_icon: row.get(8)?,
+                transaction_type: row.get(9)?,
+                amount: row.get(10)?,
+                description: row.get(11)?,
+                payee: row.get(12)?,
+                date: row.get(13)?,
+                created_at: row.get(14)?,
             })
         },
     )

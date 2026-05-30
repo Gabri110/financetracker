@@ -11,6 +11,7 @@ import Rules from "./pages/Rules";
 import Budgets from "./pages/Budgets";
 import Reports from "./pages/Reports";
 import Import from "./pages/Import";
+import ExportPage from "./pages/Export";
 import Clear from "./pages/Clear";
 import Options from "./pages/Options";
 
@@ -53,6 +54,7 @@ export default function App() {
               <Route path="/budgets" element={<Budgets />} />
               <Route path="/reports" element={<Reports />} />
               <Route path="/import" element={<Import />} />
+              <Route path="/export" element={<ExportPage />} />
               <Route path="/clear" element={<Clear />} />
               <Route path="/options" element={<Options />} />
             </Routes>

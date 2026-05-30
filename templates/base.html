@@ -262,6 +262,11 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if request.endpoint in ['export_transactions', 'export_categories', 'export_rules', 'export_full_zip', 'export_full_xlsx'] %}active{% endif %}" href="{{ url_for('export_full_zip') }}">
+                                <i class="bi bi-cloud-download"></i> Export
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if request.endpoint == 'email_inbox' %}active{% endif %}" href="{{ url_for('email_inbox') }}">
                                 <i class="bi bi-envelope-open"></i> Email
                             </a>

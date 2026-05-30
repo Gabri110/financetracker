@@ -5,9 +5,14 @@
 {% block content %}
 <div class="page-header d-flex justify-content-between align-items-center">
     <h1><i class="bi bi-receipt"></i> Transactions</h1>
-    <a href="{{ url_for('add_transaction') }}" class="btn btn-primary">
-        <i class="bi bi-plus-lg"></i> Add Transaction
-    </a>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('export_transactions') }}{% if request.query_string %}?{{ request.query_string.decode('utf-8') }}{% endif %}" class="btn btn-outline-primary">
+            <i class="bi bi-download"></i> Export Filtered CSV
+        </a>
+        <a href="{{ url_for('add_transaction') }}" class="btn btn-primary">
+            <i class="bi bi-plus-lg"></i> Add Transaction
+        </a>
+    </div>
 </div>
 
 <!-- Filters -->

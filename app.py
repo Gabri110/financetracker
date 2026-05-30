@@ -4,13 +4,16 @@ import io
 import json
 import re
 import sqlite3
+import hashlib
+import zipfile
+import importlib
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
 from urllib import request as urllib_request
 import xml.etree.ElementTree as ET
 
-from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -333,6 +336,494 @@ def convert_amount(db, amount, from_currency, to_currency):
     if rate is None:
         return float(amount)
     return float(amount) * rate
+
+
+def detect_delimiter(sample_text):
+    if '\t' in sample_text:
+        return '\t'
+    if ';' in sample_text:
+        return ';'
+    return ','
+
+
+def parse_amount_string(raw_amount):
+    amount_str = (raw_amount or '').replace('"', '').replace(' ', '').strip()
+    if not amount_str:
+        raise ValueError('Missing amount')
+
+    if ',' in amount_str and '.' in amount_str:
+        last_comma = amount_str.rfind(',')
+        last_dot = amount_str.rfind('.')
+        if last_comma > last_dot:
+            amount_str = amount_str.replace('.', '').replace(',', '.')
+        else:
+            amount_str = amount_str.replace(',', '')
+    elif ',' in amount_str:
+        if re.search(r',\d{2}$', amount_str):
+            amount_str = amount_str.replace(',', '.')
+        else:
+            amount_str = amount_str.replace(',', '')
+
+    return float(amount_str)
+
+
+def parse_import_date(raw_date):
+    normalized = (raw_date or '').strip()
+    if not normalized:
+        raise ValueError('Missing date')
+
+    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%d-%m-%Y', '%m-%d-%Y'):
+        try:
+            return datetime.strptime(normalized, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format '{raw_date}'")
+
+
+def normalized_key(*parts):
+    return '||'.join((str(part or '').strip().lower() for part in parts))
+
+
+def stable_transaction_id(account_name, account_currency, date, amount, description, payee):
+    base = '|'.join([
+        str(account_name or '').strip().lower(),
+        str(account_currency or '').strip().upper(),
+        str(date or '').strip(),
+        f"{float(amount):.2f}",
+        str(description or '').strip().lower(),
+        str(payee or '').strip().lower(),
+    ])
+    digest = hashlib.sha256(base.encode('utf-8')).hexdigest()[:16]
+    return f'auto_{digest}'
+
+
+def rows_to_csv_bytes(headers, rows):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([row.get(header, '') for header in headers])
+    return output.getvalue().encode('utf-8')
+
+
+def csv_text_to_dict_rows(csv_text):
+    if not csv_text:
+        return []
+    delimiter = detect_delimiter(csv_text[:2000])
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=delimiter)
+    rows = []
+    for row in reader:
+        normalized = {str(k or '').strip().upper(): (v or '').strip() for k, v in row.items()}
+        if any(value for value in normalized.values()):
+            rows.append(normalized)
+    return rows
+
+
+def fetch_accounts_export_rows(db, user_id):
+    accounts = db.execute(
+        '''SELECT id, name, account_type, currency, created_at
+           FROM accounts WHERE user_id = ? ORDER BY name''',
+        (user_id,),
+    ).fetchall()
+    rows = []
+    for account in accounts:
+        current_balance = get_account_current_balance(db, user_id, account['id'])
+        rows.append({
+            'ACCOUNT_NAME': account['name'],
+            'ACCOUNT_TYPE': account['account_type'],
+            'CURRENCY': normalize_currency(account['currency']),
+            'CURRENT_BALANCE': f"{float(current_balance):.2f}",
+            'CREATED_AT': account['created_at'] or '',
+        })
+    return rows
+
+
+def fetch_categories_export_rows(db, user_id):
+    categories = db.execute(
+        '''SELECT name, category_type, icon, color
+           FROM categories WHERE user_id = ? ORDER BY category_type, name''',
+        (user_id,),
+    ).fetchall()
+    return [{
+        'NAME': row['name'],
+        'CATEGORY_TYPE': row['category_type'],
+        'ICON': row['icon'] or '',
+        'COLOR': row['color'] or '',
+    } for row in categories]
+
+
+def fetch_rules_export_rows(db, user_id):
+    rules = db.execute(
+        '''SELECT r.pattern, r.match_field, r.is_regex, r.priority,
+                  c.name AS category_name, c.category_type AS category_type
+           FROM category_rules r
+           JOIN categories c ON r.category_id = c.id
+           WHERE r.user_id = ?
+           ORDER BY r.priority DESC, r.pattern''',
+        (user_id,),
+    ).fetchall()
+    return [{
+        'PATTERN': row['pattern'],
+        'CATEGORY_NAME': row['category_name'],
+        'CATEGORY_TYPE': row['category_type'],
+        'MATCH_FIELD': row['match_field'] or 'description',
+        'IS_REGEX': '1' if row['is_regex'] else '0',
+        'PRIORITY': str(row['priority'] if row['priority'] is not None else 0),
+    } for row in rules]
+
+
+def fetch_transactions_export_rows(db, user_id, filters=None):
+    filters = filters or {}
+    query = '''
+        SELECT t.id_transaction, t.date, t.transaction_type, t.amount, t.description, t.payee,
+               a.name AS account_name, a.currency AS account_currency,
+               c.name AS category_name
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        LEFT JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = ?
+    '''
+    params = [user_id]
+
+    account_id = filters.get('account_id')
+    category_id = filters.get('category_id')
+    trans_type = filters.get('type')
+    start_date = filters.get('start_date')
+    end_date = filters.get('end_date')
+    search = (filters.get('search') or '').strip()
+
+    if account_id:
+        query += ' AND t.account_id = ?'
+        params.append(account_id)
+    if category_id:
+        query += ' AND t.category_id = ?'
+        params.append(category_id)
+    if trans_type:
+        query += ' AND t.transaction_type = ?'
+        params.append(trans_type)
+    if start_date:
+        query += ' AND t.date >= ?'
+        params.append(start_date)
+    if end_date:
+        query += ' AND t.date <= ?'
+        params.append(end_date)
+    if search:
+        query += ' AND (t.description LIKE ? OR t.payee LIKE ?)'
+        params.extend([f'%{search}%', f'%{search}%'])
+
+    query += ' ORDER BY t.date DESC, t.id DESC'
+
+    records = db.execute(query, params).fetchall()
+    rows = []
+    for row in records:
+        sign = -1 if row['transaction_type'] == 'expense' else 1
+        amount_value = float(row['amount']) * sign
+        if row['transaction_type'] == 'transfer':
+            amount_value = float(row['amount'])
+
+        rows.append({
+            'ID_TRANSACTION': row['id_transaction'] or '',
+            'DATE': row['date'],
+            'AMOUNT': f"{amount_value:.2f}",
+            'CATEGORY': row['category_name'] or '',
+            'DESCRIPTION': row['description'] or '',
+            'PAYEE': row['payee'] or '',
+            'ACCOUNT_NAME': row['account_name'],
+            'ACCOUNT_CURRENCY': normalize_currency(row['account_currency']),
+            'TRANSACTION_TYPE': row['transaction_type'],
+        })
+    return rows
+
+
+def upsert_accounts_from_rows(db, user_id, account_rows):
+    existing = db.execute(
+        '''SELECT id, name, account_type, currency
+           FROM accounts WHERE user_id = ?''',
+        (user_id,),
+    ).fetchall()
+    cache = {
+        normalized_key(row['name'], row['currency'], row['account_type']): row['id']
+        for row in existing
+    }
+    created = 0
+
+    for row in account_rows:
+        name = (row.get('ACCOUNT_NAME') or '').strip()
+        if not name:
+            continue
+        account_type = (row.get('ACCOUNT_TYPE') or 'checking').strip().lower()
+        currency = normalize_currency(row.get('CURRENCY'))
+        key = normalized_key(name, currency, account_type)
+
+        if key not in cache:
+            db.execute(
+                '''INSERT INTO accounts (user_id, name, account_type, currency, balance)
+                   VALUES (?, ?, ?, ?, 0)''',
+                (user_id, name, account_type, currency),
+            )
+            cache[key] = db.execute('SELECT last_insert_rowid()').fetchone()[0]
+            created += 1
+
+    return cache, created
+
+
+def upsert_categories_from_rows(db, user_id, category_rows):
+    existing = db.execute(
+        'SELECT id, name, category_type FROM categories WHERE user_id = ?',
+        (user_id,),
+    ).fetchall()
+    cache = {normalized_key(row['name'], row['category_type']): row['id'] for row in existing}
+    inserted = 0
+    updated = 0
+
+    for row in category_rows:
+        name = (row.get('NAME') or '').strip()
+        category_type = (row.get('CATEGORY_TYPE') or '').strip().lower()
+        if not name or category_type not in ('income', 'expense', 'transfer'):
+            continue
+
+        icon = (row.get('ICON') or '📁').strip() or '📁'
+        color = (row.get('COLOR') or '#6c757d').strip() or '#6c757d'
+        key = normalized_key(name, category_type)
+        existing_id = cache.get(key)
+
+        if existing_id:
+            db.execute(
+                '''UPDATE categories
+                   SET icon = ?, color = ?
+                   WHERE id = ? AND user_id = ?''',
+                (icon, color, existing_id, user_id),
+            )
+            updated += 1
+        else:
+            db.execute(
+                '''INSERT INTO categories (user_id, name, category_type, icon, color)
+                   VALUES (?, ?, ?, ?, ?)''',
+                (user_id, name, category_type, icon, color),
+            )
+            new_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
+            cache[key] = new_id
+            inserted += 1
+
+    return cache, inserted, updated
+
+
+def upsert_rules_from_rows(db, user_id, rule_rows, category_cache):
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for idx, row in enumerate(rule_rows, 1):
+        pattern = (row.get('PATTERN') or '').strip()
+        category_name = (row.get('CATEGORY_NAME') or '').strip()
+        category_type = (row.get('CATEGORY_TYPE') or 'expense').strip().lower()
+        match_field = (row.get('MATCH_FIELD') or 'description').strip().lower()
+        is_regex = 1 if str(row.get('IS_REGEX', '0')).strip() in ('1', 'true', 'True') else 0
+        priority_raw = (row.get('PRIORITY') or '0').strip()
+
+        if not pattern or not category_name:
+            skipped += 1
+            continue
+
+        try:
+            priority = int(priority_raw)
+        except ValueError:
+            priority = 0
+
+        category_id = category_cache.get(normalized_key(category_name, category_type))
+        if not category_id:
+            skipped += 1
+            errors.append(f"Rule row {idx}: category '{category_name}' ({category_type}) not found")
+            continue
+
+        existing = db.execute(
+            '''SELECT id FROM category_rules
+               WHERE user_id = ? AND category_id = ? AND pattern = ? AND match_field = ? AND is_regex = ?''',
+            (user_id, category_id, pattern, match_field, is_regex),
+        ).fetchone()
+
+        if existing:
+            db.execute(
+                '''UPDATE category_rules SET priority = ? WHERE id = ? AND user_id = ?''',
+                (priority, existing['id'], user_id),
+            )
+            updated += 1
+        else:
+            db.execute(
+                '''INSERT INTO category_rules (user_id, category_id, pattern, match_field, is_regex, priority)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (user_id, category_id, pattern, match_field, is_regex, priority),
+            )
+            inserted += 1
+
+    return inserted, updated, skipped, errors
+
+
+def resolve_or_create_account_id(db, user_id, account_cache, account_name, account_currency, account_type='checking'):
+    normalized_name = (account_name or '').strip()
+    if not normalized_name:
+        return None
+
+    normalized_currency = normalize_currency(account_currency)
+    normalized_type = (account_type or 'checking').strip().lower()
+    key = normalized_key(normalized_name, normalized_currency, normalized_type)
+    existing_id = account_cache.get(key)
+    if existing_id:
+        return existing_id
+
+    db.execute(
+        '''INSERT INTO accounts (user_id, name, account_type, currency, balance)
+           VALUES (?, ?, ?, ?, 0)''',
+        (user_id, normalized_name, normalized_type, normalized_currency),
+    )
+    new_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
+    account_cache[key] = new_id
+    return new_id
+
+
+def resolve_category_id(category_cache, category_name, category_type):
+    if not category_name:
+        return None
+
+    normalized_name = category_name.strip()
+    if not normalized_name:
+        return None
+
+    normalized_type = (category_type or '').strip().lower()
+    if normalized_type:
+        direct = category_cache.get(normalized_key(normalized_name, normalized_type))
+        if direct:
+            return direct
+
+    for key, cat_id in category_cache.items():
+        name_part = key.split('||')[0]
+        if name_part == normalized_name.lower():
+            return cat_id
+    return None
+
+
+def upsert_transactions_from_rows(db, user_id, transaction_rows, account_cache, category_cache):
+    imported = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for idx, row in enumerate(transaction_rows, 1):
+        try:
+            account_name = (row.get('ACCOUNT_NAME') or '').strip()
+            account_currency = row.get('ACCOUNT_CURRENCY') or DEFAULT_BASE_CURRENCY
+            account_type = row.get('ACCOUNT_TYPE') or 'checking'
+            account_id = resolve_or_create_account_id(
+                db, user_id, account_cache, account_name, account_currency, account_type
+            )
+            if not account_id:
+                skipped += 1
+                errors.append(f'Row {idx}: account is required')
+                continue
+
+            date_value = parse_import_date(row.get('DATE'))
+            amount_value = parse_amount_string(row.get('AMOUNT'))
+
+            transaction_type = (row.get('TRANSACTION_TYPE') or '').strip().lower()
+            if transaction_type not in ('income', 'expense', 'transfer'):
+                transaction_type = 'income' if amount_value >= 0 else 'expense'
+
+            normalized_amount = abs(amount_value)
+            if transaction_type == 'transfer':
+                normalized_amount = abs(amount_value)
+
+            description = (row.get('DESCRIPTION') or '').strip()
+            payee = (row.get('PAYEE') or '').strip()
+            category_name = (row.get('CATEGORY') or '').strip()
+            category_type = (row.get('CATEGORY_TYPE') or '').strip().lower()
+            category_id = resolve_category_id(category_cache, category_name, category_type)
+
+            id_transaction = (row.get('ID_TRANSACTION') or '').strip()
+            if not id_transaction:
+                id_transaction = stable_transaction_id(
+                    account_name, account_currency, date_value, normalized_amount, description, payee
+                )
+
+            existing = db.execute(
+                '''SELECT id FROM transactions
+                   WHERE user_id = ? AND account_id = ? AND id_transaction = ?
+                   ORDER BY id DESC''',
+                (user_id, account_id, id_transaction),
+            ).fetchall()
+
+            if existing:
+                keep_id = existing[0]['id']
+                db.execute(
+                    '''UPDATE transactions
+                       SET category_id = ?, transaction_type = ?, amount = ?, description = ?, payee = ?, date = ?
+                       WHERE id = ? AND user_id = ?''',
+                    (category_id, transaction_type, normalized_amount, description, payee, date_value, keep_id, user_id),
+                )
+                for duplicate_row in existing[1:]:
+                    db.execute('DELETE FROM transactions WHERE id = ? AND user_id = ?', (duplicate_row['id'], user_id))
+                updated += 1
+            else:
+                db.execute(
+                    '''INSERT INTO transactions
+                       (user_id, account_id, category_id, transaction_type, amount, description, payee, date, id_transaction)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        user_id,
+                        account_id,
+                        category_id,
+                        transaction_type,
+                        normalized_amount,
+                        description,
+                        payee,
+                        date_value,
+                        id_transaction,
+                    ),
+                )
+                imported += 1
+        except Exception as exc:
+            skipped += 1
+            errors.append(f'Row {idx}: {exc}')
+
+    return imported, updated, skipped, errors
+
+
+def slugify_filename(value):
+    clean = re.sub(r'[^a-zA-Z0-9]+', '_', str(value or '').strip()).strip('_').lower()
+    return clean or 'account'
+
+
+def read_xlsx_sheet_rows(file_storage, sheet_name):
+    try:
+        openpyxl = importlib.import_module('openpyxl')
+    except ImportError as exc:
+        raise RuntimeError('openpyxl is required for XLSX import/export') from exc
+
+    workbook = openpyxl.load_workbook(filename=io.BytesIO(file_storage.read()), data_only=True)
+    if sheet_name not in workbook.sheetnames:
+        return []
+
+    sheet = workbook[sheet_name]
+    values = list(sheet.values)
+    if not values:
+        return []
+
+    headers = [str(col or '').strip().upper() for col in values[0]]
+    rows = []
+    for raw_row in values[1:]:
+        row = {}
+        has_content = False
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            cell = raw_row[idx] if idx < len(raw_row) else None
+            text_value = '' if cell is None else str(cell).strip()
+            if text_value:
+                has_content = True
+            row[header] = text_value
+        if has_content:
+            rows.append(row)
+    return rows
 
 
 @app.route('/options')
@@ -1293,6 +1784,326 @@ def import_csv():
             return redirect(url_for('import_csv'))
 
     return render_template('import.html', accounts=accounts, categories=categories)
+
+
+@app.route('/export/transactions')
+@login_required
+def export_transactions():
+    db = get_db()
+    filters = {
+        'account_id': request.args.get('account_id', type=int),
+        'category_id': request.args.get('category_id', type=int),
+        'type': request.args.get('type'),
+        'start_date': request.args.get('start_date'),
+        'end_date': request.args.get('end_date'),
+        'search': request.args.get('search', ''),
+    }
+
+    rows = fetch_transactions_export_rows(db, current_user.id, filters)
+    headers = [
+        'ID_TRANSACTION',
+        'DATE',
+        'AMOUNT',
+        'CATEGORY',
+        'DESCRIPTION',
+        'PAYEE',
+        'ACCOUNT_NAME',
+        'ACCOUNT_CURRENCY',
+        'TRANSACTION_TYPE',
+    ]
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    payload = rows_to_csv_bytes(headers, rows)
+    return send_file(
+        io.BytesIO(payload),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f'transactions_{timestamp}.csv',
+    )
+
+
+@app.route('/export/categories')
+@login_required
+def export_categories():
+    db = get_db()
+    rows = fetch_categories_export_rows(db, current_user.id)
+    headers = ['NAME', 'CATEGORY_TYPE', 'ICON', 'COLOR']
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    payload = rows_to_csv_bytes(headers, rows)
+    return send_file(
+        io.BytesIO(payload),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f'categories_{timestamp}.csv',
+    )
+
+
+@app.route('/export/rules')
+@login_required
+def export_rules():
+    db = get_db()
+    rows = fetch_rules_export_rows(db, current_user.id)
+    headers = ['PATTERN', 'CATEGORY_NAME', 'CATEGORY_TYPE', 'MATCH_FIELD', 'IS_REGEX', 'PRIORITY']
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    payload = rows_to_csv_bytes(headers, rows)
+    return send_file(
+        io.BytesIO(payload),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f'rules_{timestamp}.csv',
+    )
+
+
+@app.route('/export/full.zip')
+@login_required
+def export_full_zip():
+    db = get_db()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    account_rows = fetch_accounts_export_rows(db, current_user.id)
+    category_rows = fetch_categories_export_rows(db, current_user.id)
+    rule_rows = fetch_rules_export_rows(db, current_user.id)
+    tx_rows = fetch_transactions_export_rows(db, current_user.id)
+
+    headers_accounts = ['ACCOUNT_NAME', 'ACCOUNT_TYPE', 'CURRENCY', 'CURRENT_BALANCE', 'CREATED_AT']
+    headers_categories = ['NAME', 'CATEGORY_TYPE', 'ICON', 'COLOR']
+    headers_rules = ['PATTERN', 'CATEGORY_NAME', 'CATEGORY_TYPE', 'MATCH_FIELD', 'IS_REGEX', 'PRIORITY']
+    headers_transactions = [
+        'ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION',
+        'PAYEE', 'ACCOUNT_NAME', 'ACCOUNT_CURRENCY', 'TRANSACTION_TYPE'
+    ]
+
+    package_bytes = io.BytesIO()
+    with zipfile.ZipFile(package_bytes, mode='w', compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('accounts.csv', rows_to_csv_bytes(headers_accounts, account_rows))
+        archive.writestr('categories.csv', rows_to_csv_bytes(headers_categories, category_rows))
+        archive.writestr('rules.csv', rows_to_csv_bytes(headers_rules, rule_rows))
+
+        grouped_transactions = defaultdict(list)
+        for row in tx_rows:
+            grouped_transactions[row['ACCOUNT_NAME']].append(row)
+
+        for account_name, rows in grouped_transactions.items():
+            slug = slugify_filename(account_name)
+            archive.writestr(
+                f'transactions_{slug}.csv',
+                rows_to_csv_bytes(headers_transactions, rows),
+            )
+
+        manifest = {
+            'format_version': '1.0',
+            'generated_at': datetime.now().isoformat(),
+            'user_id': current_user.id,
+            'counts': {
+                'accounts': len(account_rows),
+                'categories': len(category_rows),
+                'rules': len(rule_rows),
+                'transactions': len(tx_rows),
+            },
+        }
+        archive.writestr('manifest.json', json.dumps(manifest, indent=2))
+
+    package_bytes.seek(0)
+    return send_file(
+        package_bytes,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'financetracker_backup_{timestamp}.zip',
+    )
+
+
+@app.route('/export/full.xlsx')
+@login_required
+def export_full_xlsx():
+    try:
+        openpyxl = importlib.import_module('openpyxl')
+    except ImportError:
+        flash('openpyxl is required for XLSX export. Install it from requirements.txt.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    db = get_db()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    account_rows = fetch_accounts_export_rows(db, current_user.id)
+    category_rows = fetch_categories_export_rows(db, current_user.id)
+    rule_rows = fetch_rules_export_rows(db, current_user.id)
+    tx_rows = fetch_transactions_export_rows(db, current_user.id)
+
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+
+    def write_sheet(name, headers, rows):
+        ws = workbook.create_sheet(name)
+        ws.append(headers)
+        for row in rows:
+            ws.append([row.get(header, '') for header in headers])
+
+    metadata_rows = [
+        {'KEY': 'format_version', 'VALUE': '1.0'},
+        {'KEY': 'generated_at', 'VALUE': datetime.now().isoformat()},
+        {'KEY': 'user_id', 'VALUE': str(current_user.id)},
+        {'KEY': 'accounts_count', 'VALUE': str(len(account_rows))},
+        {'KEY': 'categories_count', 'VALUE': str(len(category_rows))},
+        {'KEY': 'rules_count', 'VALUE': str(len(rule_rows))},
+        {'KEY': 'transactions_count', 'VALUE': str(len(tx_rows))},
+    ]
+
+    write_sheet('Metadata', ['KEY', 'VALUE'], metadata_rows)
+    write_sheet('Accounts', ['ACCOUNT_NAME', 'ACCOUNT_TYPE', 'CURRENCY', 'CURRENT_BALANCE', 'CREATED_AT'], account_rows)
+    write_sheet('Categories', ['NAME', 'CATEGORY_TYPE', 'ICON', 'COLOR'], category_rows)
+    write_sheet('Rules', ['PATTERN', 'CATEGORY_NAME', 'CATEGORY_TYPE', 'MATCH_FIELD', 'IS_REGEX', 'PRIORITY'], rule_rows)
+    write_sheet(
+        'Transactions',
+        ['ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION', 'PAYEE', 'ACCOUNT_NAME', 'ACCOUNT_CURRENCY', 'TRANSACTION_TYPE'],
+        tx_rows,
+    )
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=f'financetracker_backup_{timestamp}.xlsx',
+    )
+
+
+@app.route('/import/categories', methods=['POST'])
+@login_required
+def import_categories_csv():
+    if 'categories_file' not in request.files:
+        flash('No categories file selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    file = request.files['categories_file']
+    if not file or not file.filename:
+        flash('No categories file selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    db = get_db()
+    try:
+        rows = csv_text_to_dict_rows(file.read().decode('utf-8'))
+        _, inserted, updated = upsert_categories_from_rows(db, current_user.id, rows)
+        db.commit()
+        flash(f'Categories import complete: {inserted} inserted, {updated} updated.', 'success')
+    except Exception as exc:
+        flash(f'Failed to import categories: {exc}', 'danger')
+
+    return redirect(url_for('import_csv'))
+
+
+@app.route('/import/rules', methods=['POST'])
+@login_required
+def import_rules_csv():
+    if 'rules_file' not in request.files:
+        flash('No rules file selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    file = request.files['rules_file']
+    if not file or not file.filename:
+        flash('No rules file selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    db = get_db()
+    try:
+        rows = csv_text_to_dict_rows(file.read().decode('utf-8'))
+        categories = db.execute(
+            'SELECT id, name, category_type FROM categories WHERE user_id = ?',
+            (current_user.id,),
+        ).fetchall()
+        category_cache = {normalized_key(row['name'], row['category_type']): row['id'] for row in categories}
+
+        inserted, updated, skipped, errors = upsert_rules_from_rows(db, current_user.id, rows, category_cache)
+        db.commit()
+
+        flash(
+            f'Rules import complete: {inserted} inserted, {updated} updated, {skipped} skipped.',
+            'success',
+        )
+        if errors:
+            flash(f'Rules import warnings: {len(errors)} issue(s).', 'warning')
+    except Exception as exc:
+        flash(f'Failed to import rules: {exc}', 'danger')
+
+    return redirect(url_for('import_csv'))
+
+
+@app.route('/import/full', methods=['POST'])
+@login_required
+def import_full_package():
+    if 'package_file' not in request.files:
+        flash('No backup package selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    file = request.files['package_file']
+    if not file or not file.filename:
+        flash('No backup package selected.', 'danger')
+        return redirect(url_for('import_csv'))
+
+    filename = file.filename.lower()
+    db = get_db()
+
+    account_rows = []
+    category_rows = []
+    rule_rows = []
+    transaction_rows = []
+
+    try:
+        if filename.endswith('.zip'):
+            package = zipfile.ZipFile(io.BytesIO(file.read()))
+
+            if 'accounts.csv' in package.namelist():
+                account_rows = csv_text_to_dict_rows(package.read('accounts.csv').decode('utf-8'))
+            if 'categories.csv' in package.namelist():
+                category_rows = csv_text_to_dict_rows(package.read('categories.csv').decode('utf-8'))
+            if 'rules.csv' in package.namelist():
+                rule_rows = csv_text_to_dict_rows(package.read('rules.csv').decode('utf-8'))
+
+            for name in package.namelist():
+                lower_name = name.lower()
+                if lower_name.startswith('transactions') and lower_name.endswith('.csv'):
+                    transaction_rows.extend(csv_text_to_dict_rows(package.read(name).decode('utf-8')))
+
+        elif filename.endswith('.xlsx'):
+            raw = file.read()
+            account_rows = read_xlsx_sheet_rows(io.BytesIO(raw), 'Accounts')
+            category_rows = read_xlsx_sheet_rows(io.BytesIO(raw), 'Categories')
+            rule_rows = read_xlsx_sheet_rows(io.BytesIO(raw), 'Rules')
+            transaction_rows = read_xlsx_sheet_rows(io.BytesIO(raw), 'Transactions')
+        else:
+            flash('Unsupported package format. Use .zip or .xlsx.', 'danger')
+            return redirect(url_for('import_csv'))
+
+        account_cache, created_accounts = upsert_accounts_from_rows(db, current_user.id, account_rows)
+        category_cache, inserted_categories, updated_categories = upsert_categories_from_rows(db, current_user.id, category_rows)
+        inserted_rules, updated_rules, skipped_rules, rule_errors = upsert_rules_from_rows(
+            db, current_user.id, rule_rows, category_cache
+        )
+        imported_tx, updated_tx, skipped_tx, tx_errors = upsert_transactions_from_rows(
+            db, current_user.id, transaction_rows, account_cache, category_cache
+        )
+
+        db.commit()
+
+        flash(
+            (
+                f'Backup import complete. Accounts created: {created_accounts}; '
+                f'Categories inserted/updated: {inserted_categories}/{updated_categories}; '
+                f'Rules inserted/updated/skipped: {inserted_rules}/{updated_rules}/{skipped_rules}; '
+                f'Transactions inserted/updated/skipped: {imported_tx}/{updated_tx}/{skipped_tx}.'
+            ),
+            'success',
+        )
+
+        warning_count = len(rule_errors) + len(tx_errors)
+        if warning_count:
+            flash(f'Import completed with {warning_count} warning(s).', 'warning')
+    except Exception as exc:
+        db.rollback()
+        flash(f'Failed to import backup package: {exc}', 'danger')
+
+    return redirect(url_for('import_csv'))
 
 
 # Category routes

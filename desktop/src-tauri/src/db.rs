@@ -81,6 +81,20 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Migration: add optional external transaction id used for idempotent imports.
+    let mut has_id_transaction = false;
+    let mut pragma = conn.prepare("PRAGMA table_info(transactions)")?;
+    let columns = pragma.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column?.eq_ignore_ascii_case("id_transaction") {
+            has_id_transaction = true;
+            break;
+        }
+    }
+    if !has_id_transaction {
+        conn.execute("ALTER TABLE transactions ADD COLUMN id_transaction TEXT", [])?;
+    }
+
     seed_default_categories(conn)?;
     Ok(())
 }

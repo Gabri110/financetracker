@@ -98,11 +98,15 @@ pub fn run() {
             commands::transactions::update_transaction,
             commands::transactions::delete_transaction,
             commands::transactions::import_csv,
+            commands::transactions::export_transactions_csv,
+            commands::transactions::import_transactions_canonical_csv,
             // Categories
             commands::categories::get_categories,
             commands::categories::add_category,
             commands::categories::update_category,
             commands::categories::delete_category,
+            commands::categories::export_categories_csv,
+            commands::categories::import_categories_csv,
             // Budgets
             commands::budgets::get_budgets,
             commands::budgets::add_budget,
@@ -114,6 +118,8 @@ pub fn run() {
             commands::rules::update_rule,
             commands::rules::delete_rule,
             commands::rules::auto_categorize,
+            commands::rules::export_rules_csv,
+            commands::rules::import_rules_csv,
             // FX / settings
             commands::fx::get_base_currency,
             commands::fx::set_base_currency,
@@ -126,6 +132,11 @@ pub fn run() {
             commands::reports::get_category_spending,
             commands::reports::get_top_payees,
             commands::reports::get_recent_transactions,
+            // Full backup
+            commands::backup::export_full_backup_zip_base64,
+            commands::backup::export_full_backup_xlsx_base64,
+            commands::backup::import_full_backup_zip_base64,
+            commands::backup::import_full_backup_xlsx_base64,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -9,6 +9,31 @@
 
 <div class="row justify-content-center">
     <div class="col-md-8 col-lg-6">
+        <div class="card mb-4">
+            <div class="card-header">
+                <i class="bi bi-cloud-download"></i> Export Data
+            </div>
+            <div class="card-body">
+                <div class="d-grid gap-2">
+                    <a class="btn btn-outline-primary" href="{{ url_for('export_transactions') }}">
+                        <i class="bi bi-filetype-csv"></i> Export Transactions (CSV)
+                    </a>
+                    <a class="btn btn-outline-primary" href="{{ url_for('export_categories') }}">
+                        <i class="bi bi-tags"></i> Export Categories (CSV)
+                    </a>
+                    <a class="btn btn-outline-primary" href="{{ url_for('export_rules') }}">
+                        <i class="bi bi-funnel"></i> Export Rules (CSV)
+                    </a>
+                    <a class="btn btn-outline-success" href="{{ url_for('export_full_zip') }}">
+                        <i class="bi bi-file-earmark-zip"></i> Export Full Backup (ZIP + CSV)
+                    </a>
+                    <a class="btn btn-outline-success" href="{{ url_for('export_full_xlsx') }}">
+                        <i class="bi bi-file-earmark-spreadsheet"></i> Export Full Backup (Excel)
+                    </a>
+                </div>
+            </div>
+        </div>
+
         <div class="card">
             <div class="card-body p-4">
                 {% if not accounts %}
@@ -96,6 +121,60 @@
                     </div>
                 </form>
                 {% endif %}
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-header">
+                <i class="bi bi-tags"></i> Import Categories (CSV)
+            </div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('import_categories_csv') }}" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Categories File</label>
+                        <input type="file" class="form-control" name="categories_file" accept=".csv" required>
+                    </div>
+                    <button type="submit" class="btn btn-outline-primary">
+                        <i class="bi bi-cloud-upload"></i> Import Categories
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-header">
+                <i class="bi bi-funnel"></i> Import Rules (CSV)
+            </div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('import_rules_csv') }}" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Rules File</label>
+                        <input type="file" class="form-control" name="rules_file" accept=".csv" required>
+                    </div>
+                    <button type="submit" class="btn btn-outline-primary">
+                        <i class="bi bi-cloud-upload"></i> Import Rules
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-header">
+                <i class="bi bi-arrow-repeat"></i> Restore Full Backup
+            </div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('import_full_package') }}" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Backup File (.zip or .xlsx)</label>
+                        <input type="file" class="form-control" name="package_file" accept=".zip,.xlsx" required>
+                    </div>
+                    <div class="alert alert-info small">
+                        Merge mode: existing records are updated by stable keys where possible and new records are inserted.
+                    </div>
+                    <button type="submit" class="btn btn-success">
+                        <i class="bi bi-arrow-repeat"></i> Restore Backup
+                    </button>
+                </form>
             </div>
         </div>
 
