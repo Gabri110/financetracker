@@ -34,15 +34,20 @@
                     </div>
 
                     <div class="row">
-                        <div class="col-md-7 mb-3">
+                        <div class="col-md-6 mb-3">
                             <label for="asset_name" class="form-label">Asset Name *</label>
                             <input type="text" class="form-control" id="asset_name" name="asset_name" required
                                    value="{{ holding.asset_name if holding else '' }}" placeholder="e.g., Vanguard FTSE All-World ETF">
                         </div>
-                        <div class="col-md-5 mb-3">
+                        <div class="col-md-3 mb-3">
                             <label for="ticker" class="form-label">Ticker</label>
                             <input type="text" class="form-control" id="ticker" name="ticker"
                                    value="{{ holding.ticker if holding else '' }}" placeholder="e.g., VWCE">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label for="isin" class="form-label">ISIN</label>
+                            <input type="text" class="form-control" id="isin" name="isin"
+                                   value="{{ holding.isin if holding else '' }}" placeholder="e.g., IE00BK5BQT80">
                         </div>
                     </div>
 
@@ -78,9 +83,18 @@
                         <a href="{{ url_for('investments') }}" class="btn btn-outline-secondary">
                             <i class="bi bi-arrow-left"></i> Cancel
                         </a>
-                        <button type="submit" class="btn btn-primary">
-                            <i class="bi bi-check-lg"></i> {{ 'Save Changes' if holding else 'Add Holding' }}
-                        </button>
+                        <div class="d-flex gap-2">
+                                {% if holding and (holding.ticker or holding.isin) and holding.asset_class in ['ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund'] %}
+                            <button type="submit" class="btn btn-outline-secondary"
+                                    formmethod="POST"
+                                    formaction="{{ url_for('sync_investment_holding_price', holding_id=holding.id) }}">
+                                <i class="bi bi-arrow-repeat"></i> Sync Price
+                            </button>
+                            {% endif %}
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-lg"></i> {{ 'Save Changes' if holding else 'Add Holding' }}
+                            </button>
+                        </div>
                     </div>
                 </form>
             </div>

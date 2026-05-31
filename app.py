@@ -11,7 +11,9 @@ from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
+from urllib.error import HTTPError
 from urllib import request as urllib_request
+from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 
 from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file
@@ -33,14 +35,45 @@ ECB_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
 SUPPORTED_CURRENCIES = {'EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN'}
 INVESTMENT_ASSET_CLASSES = (
     'ETF',
+    'IF',
     'Fixed Income Fund',
     'Private Equity Fund',
     'Mintos Lending',
 )
 INVESTMENT_INCOME_PROFILES = ('fixed', 'variable')
+INVESTMENT_MARKET_SYNCABLE_CLASSES = ('ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund')
+STOOQ_QUOTE_URL = 'https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv'
+YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
+YAHOO_CHART_URL_ALT = 'https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
+YAHOO_SEARCH_URL = 'https://query1.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=10&newsCount=0'
+YAHOO_SEARCH_URL_ALT = 'https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=10&newsCount=0'
+HTTP_BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'application/json,text/plain,*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+}
+MARKET_QUOTE_CACHE_TTL_SECONDS = 15 * 60
+YAHOO_SYMBOL_CACHE_TTL_SECONDS = 24 * 60 * 60
 DECIMAL_QUANTITY_PLACES = Decimal('0.00000001')
 DECIMAL_MONEY_PLACES = Decimal('0.00000001')
 FRACTIONAL_TOLERANCE = Decimal('0.00000001')
+QUOTE_SUFFIX_CURRENCY_MAP = {
+    'US': 'USD',
+    'DE': 'EUR',
+    'F': 'EUR',
+    'PA': 'EUR',
+    'AS': 'EUR',
+    'BR': 'EUR',
+    'MI': 'EUR',
+    'L': 'GBP',
+    'SW': 'CHF',
+    'TO': 'CAD',
+    'V': 'CAD',
+    'AX': 'AUD',
+    'T': 'JPY',
+}
 SYMBOL_BY_CURRENCY = {
     'EUR': '€',
     'USD': '$',
@@ -58,6 +91,9 @@ SYMBOL_BY_CURRENCY = {
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+
+MARKET_QUOTE_CACHE = {}
+YAHOO_SYMBOL_CACHE = {}
 
 
 def normalize_currency(currency):
@@ -219,6 +255,7 @@ def init_db():
             account_id INTEGER NOT NULL,
             asset_name TEXT NOT NULL,
             ticker TEXT,
+            isin TEXT,
             asset_class TEXT NOT NULL,
             currency TEXT DEFAULT 'EUR',
             quantity REAL NOT NULL DEFAULT 0,
@@ -296,6 +333,12 @@ def init_db():
         db.execute("ALTER TABLE accounts ADD COLUMN income_profile TEXT")
     if 'is_investment_dashboard' not in account_columns:
         db.execute('ALTER TABLE accounts ADD COLUMN is_investment_dashboard INTEGER DEFAULT 0')
+
+    holding_columns = {
+        row['name'] for row in db.execute('PRAGMA table_info(investment_holdings)').fetchall()
+    }
+    if 'isin' not in holding_columns:
+        db.execute('ALTER TABLE investment_holdings ADD COLUMN isin TEXT')
 
     db.commit()
 
@@ -417,6 +460,266 @@ def convert_amount(db, amount, from_currency, to_currency):
     if rate is None:
         return float(amount)
     return float(amount) * rate
+
+
+def normalize_ticker_symbol(ticker):
+    return (ticker or '').strip().upper().replace(' ', '')
+
+
+def normalize_isin(isin):
+    return (isin or '').strip().upper().replace(' ', '')
+
+
+def is_isin(value):
+    normalized = normalize_isin(value)
+    return bool(re.fullmatch(r'[A-Z]{2}[A-Z0-9]{10}', normalized))
+
+
+def normalize_market_identifier(identifier):
+    return (identifier or '').strip().upper().replace(' ', '')
+
+
+def get_cached_item(cache_store, key, ttl_seconds):
+    entry = cache_store.get(key)
+    if not entry:
+        return None
+    if (datetime.now() - entry['timestamp']).total_seconds() > ttl_seconds:
+        cache_store.pop(key, None)
+        return None
+    return entry['value']
+
+
+def set_cached_item(cache_store, key, value):
+    cache_store[key] = {
+        'timestamp': datetime.now(),
+        'value': value,
+    }
+
+
+def fetch_json_with_headers(url):
+    request_obj = urllib_request.Request(url, headers=HTTP_BROWSER_HEADERS)
+    with urllib_request.urlopen(request_obj, timeout=8) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+def fetch_text_with_headers(url):
+    request_obj = urllib_request.Request(url, headers=HTTP_BROWSER_HEADERS)
+    with urllib_request.urlopen(request_obj, timeout=8) as response:
+        return response.read().decode('utf-8', errors='ignore')
+
+
+def infer_quote_currency_from_ticker(ticker):
+    normalized = normalize_ticker_symbol(ticker)
+    if '.' not in normalized:
+        return None
+    suffix = normalized.split('.')[-1]
+    return QUOTE_SUFFIX_CURRENCY_MAP.get(suffix)
+
+
+def infer_quote_currency_from_stooq_source(source_label):
+    if not source_label or '(' not in source_label or ')' not in source_label:
+        return None
+    symbol = source_label.split('(', 1)[1].split(')', 1)[0]
+    return infer_quote_currency_from_ticker(symbol)
+
+
+def resolve_holding_market_identifiers(holding):
+    asset_class = (holding['asset_class'] or '').strip()
+    ticker = normalize_ticker_symbol(holding['ticker'])
+    isin = normalize_isin(holding['isin'])
+
+    ordered = []
+    if asset_class == 'IF':
+        ordered = [isin, ticker]
+    else:
+        ordered = [ticker, isin]
+
+    seen = set()
+    identifiers = []
+    for candidate in ordered:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        identifiers.append(candidate)
+    return identifiers
+
+
+def fetch_stooq_price(identifier):
+    normalized = normalize_market_identifier(identifier)
+    if not normalized:
+        raise ValueError('Ticker/identifier is required.')
+
+    if is_isin(normalized):
+        raise ValueError('Stooq lookup by ISIN is not supported.')
+
+    candidates = [normalized]
+    if '.' not in normalized:
+        candidates.append(f'{normalized}.US')
+
+    for symbol in candidates:
+        try:
+            url = STOOQ_QUOTE_URL.format(symbol=symbol.lower())
+            csv_text = fetch_text_with_headers(url)
+            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            if not rows:
+                continue
+            close_value = (rows[0].get('Close') or '').strip()
+            if not close_value or close_value == 'N/D':
+                continue
+            return {
+                'price': float(close_value),
+                'currency': None,
+                'source': f'Stooq ({symbol})',
+            }
+        except Exception:
+            continue
+
+    raise ValueError('Stooq could not provide a valid close price.')
+
+
+def resolve_yahoo_symbol(identifier):
+    normalized = normalize_market_identifier(identifier)
+    if not normalized:
+        return None
+
+    cached_symbol = get_cached_item(YAHOO_SYMBOL_CACHE, normalized, YAHOO_SYMBOL_CACHE_TTL_SECONDS)
+    if cached_symbol:
+        return cached_symbol
+
+    errors = []
+    for template in (YAHOO_SEARCH_URL, YAHOO_SEARCH_URL_ALT):
+        url = template.format(query=quote_plus(normalized))
+        try:
+            payload = fetch_json_with_headers(url)
+            for quote in (payload.get('quotes') or []):
+                symbol = normalize_ticker_symbol(quote.get('symbol'))
+                if symbol:
+                    set_cached_item(YAHOO_SYMBOL_CACHE, normalized, symbol)
+                    return symbol
+        except HTTPError as exc:
+            errors.append(str(exc))
+            continue
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+
+    if errors:
+        raise ValueError('; '.join(errors))
+    return None
+
+
+def fetch_yahoo_price(identifier):
+    normalized = normalize_market_identifier(identifier)
+    if not normalized:
+        raise ValueError('Ticker/identifier is required.')
+
+    query_symbol = normalized
+    if is_isin(normalized):
+        resolved_symbol = resolve_yahoo_symbol(normalized)
+        if not resolved_symbol:
+            raise ValueError('Yahoo search could not resolve this ISIN.')
+        query_symbol = resolved_symbol
+
+    payload = None
+    errors = []
+    for template in (YAHOO_CHART_URL, YAHOO_CHART_URL_ALT):
+        url = template.format(ticker=quote_plus(query_symbol))
+        try:
+            payload = fetch_json_with_headers(url)
+            break
+        except HTTPError as exc:
+            errors.append(str(exc))
+            continue
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+
+    if payload is None:
+        raise ValueError('; '.join(errors) if errors else 'Yahoo chart request failed.')
+
+    result_list = (((payload or {}).get('chart') or {}).get('result') or [])
+    if not result_list:
+        raise ValueError('Yahoo returned no chart result.')
+
+    result = result_list[0]
+    meta = result.get('meta') or {}
+    quote_items = ((result.get('indicators') or {}).get('quote') or [])
+    if not quote_items:
+        raise ValueError('Yahoo returned no quote payload.')
+
+    closes = quote_items[0].get('close') or []
+    close_price = None
+    for value in reversed(closes):
+        if value is not None:
+            close_price = float(value)
+            break
+
+    if close_price is None:
+        raise ValueError('Yahoo returned no close values.')
+
+    return {
+        'price': close_price,
+        'currency': normalize_currency(meta.get('currency', '')),
+        'source': f'Yahoo ({query_symbol})',
+    }
+
+
+def fetch_market_price(identifier):
+    errors = []
+    normalized = normalize_market_identifier(identifier)
+    cached_quote = get_cached_item(MARKET_QUOTE_CACHE, normalized, MARKET_QUOTE_CACHE_TTL_SECONDS)
+    if cached_quote:
+        return cached_quote
+
+    identifier_is_isin = is_isin(normalized)
+    stooq_quote = None
+    if not identifier_is_isin:
+        try:
+            stooq_quote = fetch_stooq_price(identifier)
+            if not stooq_quote.get('currency'):
+                stooq_quote['currency'] = infer_quote_currency_from_ticker(identifier)
+            if not stooq_quote.get('currency'):
+                stooq_quote['currency'] = infer_quote_currency_from_stooq_source(stooq_quote.get('source'))
+            if stooq_quote.get('currency'):
+                set_cached_item(MARKET_QUOTE_CACHE, normalized, stooq_quote)
+                return stooq_quote
+        except Exception as exc:
+            errors.append(str(exc))
+
+    try:
+        yahoo_quote = fetch_yahoo_price(identifier)
+        if stooq_quote and stooq_quote.get('price'):
+            # Keep Stooq as preferred price source, enrich with Yahoo currency.
+            stooq_quote['currency'] = yahoo_quote.get('currency') or stooq_quote.get('currency')
+            set_cached_item(MARKET_QUOTE_CACHE, normalized, stooq_quote)
+            return stooq_quote
+        set_cached_item(MARKET_QUOTE_CACHE, normalized, yahoo_quote)
+        return yahoo_quote
+    except Exception as exc:
+        errors.append(str(exc))
+
+    # Final fallback if Stooq had a price but currency enrichment failed.
+    if stooq_quote and stooq_quote.get('price'):
+        return stooq_quote
+
+    if errors and all('429' in str(err) for err in errors):
+        raise ValueError('Market data provider rate-limited the request (HTTP 429). Please retry in a minute.')
+
+    raise ValueError('; '.join(errors) if errors else 'No provider returned a market price.')
+
+
+def convert_quote_to_holding_currency(db, quote_price, quote_currency, holding_currency, base_currency):
+    quote_currency = normalize_currency(quote_currency)
+    holding_currency = normalize_currency(holding_currency)
+
+    if not quote_currency or quote_currency == holding_currency:
+        return float(quote_price)
+
+    if quote_currency not in SUPPORTED_CURRENCIES or holding_currency not in SUPPORTED_CURRENCIES:
+        raise ValueError(f'Unsupported quote currency conversion {quote_currency} -> {holding_currency}.')
+
+    ensure_daily_rates(db, base_currency)
+    return convert_amount(db, quote_price, quote_currency, holding_currency)
 
 
 def detect_delimiter(sample_text):
@@ -1734,6 +2037,7 @@ def investments():
         investment_accounts=investment_accounts,
         base_currency=base_currency,
         asset_classes=INVESTMENT_ASSET_CLASSES,
+        market_syncable_classes=INVESTMENT_MARKET_SYNCABLE_CLASSES,
         today=datetime.now().strftime('%Y-%m-%d'),
         **dashboard_data,
     )
@@ -1869,8 +2173,9 @@ def add_investment_holding():
         account_id = request.form.get('account_id', type=int)
         asset_name = request.form.get('asset_name', '').strip()
         ticker = request.form.get('ticker', '').strip().upper()
+        isin = normalize_isin(request.form.get('isin', ''))
         asset_class = request.form.get('asset_class', '').strip()
-        currency = normalize_currency(request.form.get('currency', 'USD'))
+        currency = normalize_currency(request.form.get('currency', 'EUR'))
 
         try:
             quantity = parse_decimal_field(request.form.get('quantity', 0), 'Quantity', DECIMAL_QUANTITY_PLACES)
@@ -1910,6 +2215,14 @@ def add_investment_holding():
                 investment_accounts=investment_accounts,
                 asset_classes=INVESTMENT_ASSET_CLASSES,
             )
+        if asset_class == 'IF' and not (isin or ticker):
+            flash('IF holdings require an ISIN or ticker.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=None,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
         if asset_class == 'Mintos Lending':
             quantity = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
 
@@ -1924,9 +2237,9 @@ def add_investment_holding():
 
         db.execute(
             '''INSERT INTO investment_holdings
-               (user_id, account_id, asset_name, ticker, asset_class, currency, quantity, avg_cost, current_price, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
-                (current_user.id, account_id, asset_name, ticker, asset_class, currency, float(quantity), float(avg_cost), float(current_price)),
+               (user_id, account_id, asset_name, ticker, isin, asset_class, currency, quantity, avg_cost, current_price, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+            (current_user.id, account_id, asset_name, ticker, isin, asset_class, currency, float(quantity), float(avg_cost), float(current_price)),
         )
         db.commit()
         flash('Holding added successfully.', 'success')
@@ -1966,8 +2279,9 @@ def edit_investment_holding(holding_id):
         account_id = request.form.get('account_id', type=int)
         asset_name = request.form.get('asset_name', '').strip()
         ticker = request.form.get('ticker', '').strip().upper()
+        isin = normalize_isin(request.form.get('isin', ''))
         asset_class = request.form.get('asset_class', '').strip()
-        currency = normalize_currency(request.form.get('currency', 'USD'))
+        currency = normalize_currency(request.form.get('currency', 'EUR'))
 
         try:
             quantity = parse_decimal_field(request.form.get('quantity', 0), 'Quantity', DECIMAL_QUANTITY_PLACES)
@@ -2007,6 +2321,14 @@ def edit_investment_holding(holding_id):
                 investment_accounts=investment_accounts,
                 asset_classes=INVESTMENT_ASSET_CLASSES,
             )
+        if asset_class == 'IF' and not (isin or ticker):
+            flash('IF holdings require an ISIN or ticker.', 'danger')
+            return render_template(
+                'investment_holding_form.html',
+                holding=holding,
+                investment_accounts=investment_accounts,
+                asset_classes=INVESTMENT_ASSET_CLASSES,
+            )
         if asset_class == 'Mintos Lending':
             quantity = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
 
@@ -2024,6 +2346,7 @@ def edit_investment_holding(holding_id):
                SET account_id = ?,
                    asset_name = ?,
                    ticker = ?,
+                   isin = ?,
                    asset_class = ?,
                    currency = ?,
                    quantity = ?,
@@ -2035,6 +2358,7 @@ def edit_investment_holding(holding_id):
                 account_id,
                 asset_name,
                 ticker,
+                isin,
                 asset_class,
                 currency,
                 float(quantity),
@@ -2074,6 +2398,145 @@ def delete_investment_holding(holding_id):
                (holding_id, current_user.id))
     db.commit()
     flash('Holding deleted.', 'info')
+    return redirect(url_for('investments'))
+
+
+@app.route('/investments/holdings/<int:holding_id>/sync-price', methods=['POST'])
+@login_required
+def sync_investment_holding_price(holding_id):
+    db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+
+    holding = db.execute(
+        '''SELECT h.*, a.user_id AS account_user_id
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.id = ? AND h.user_id = ? AND a.user_id = ?''',
+        (holding_id, current_user.id, current_user.id),
+    ).fetchone()
+
+    if not holding:
+        flash('Holding not found.', 'danger')
+        return redirect(url_for('investments'))
+
+    if holding['asset_class'] not in INVESTMENT_MARKET_SYNCABLE_CLASSES:
+        flash('This asset class is not eligible for market sync.', 'warning')
+        return redirect(url_for('edit_investment_holding', holding_id=holding_id))
+
+    identifiers = resolve_holding_market_identifiers(holding)
+    if not identifiers:
+        flash('Cannot sync price without ticker/ISIN.', 'warning')
+        return redirect(url_for('edit_investment_holding', holding_id=holding_id))
+
+    try:
+        quote = None
+        last_exc = None
+        for identifier in identifiers:
+            try:
+                quote = fetch_market_price(identifier)
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if quote is None:
+            raise last_exc or ValueError('No provider returned a market price.')
+
+        synced_price = convert_quote_to_holding_currency(
+            db,
+            quote['price'],
+            quote.get('currency'),
+            holding['currency'],
+            base_currency,
+        )
+        db.execute(
+            '''UPDATE investment_holdings
+               SET current_price = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?''',
+            (float(round(synced_price, 8)), holding_id, current_user.id),
+        )
+        db.commit()
+        flash(f'Price synced from {quote["source"]}: {holding["currency"]} {synced_price:,.4f}', 'success')
+    except Exception as exc:
+        flash(f'Price sync failed: {exc}', 'warning')
+
+    return redirect(url_for('edit_investment_holding', holding_id=holding_id))
+
+
+@app.route('/investments/sync-prices', methods=['POST'])
+@login_required
+def sync_all_investment_prices():
+    db = get_db()
+    base_currency = get_user_base_currency(current_user.id)
+
+    holdings = db.execute(
+        '''SELECT h.*
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.user_id = ?
+             AND a.user_id = ?
+             AND a.account_type = 'investment'
+             AND COALESCE(a.is_investment_dashboard, 0) = 1
+           ORDER BY h.asset_name''',
+        (current_user.id, current_user.id),
+    ).fetchall()
+
+    updated = 0
+    skipped = []
+    failed = []
+
+    for holding in holdings:
+        if holding['asset_class'] not in INVESTMENT_MARKET_SYNCABLE_CLASSES:
+            skipped.append(f"{holding['asset_name']} (ineligible class)")
+            continue
+
+        identifiers = resolve_holding_market_identifiers(holding)
+        if not identifiers:
+            skipped.append(f"{holding['asset_name']} (missing ticker/ISIN)")
+            continue
+
+        try:
+            quote = None
+            last_exc = None
+            for identifier in identifiers:
+                try:
+                    quote = fetch_market_price(identifier)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+
+            if quote is None:
+                raise last_exc or ValueError('No provider returned a market price.')
+
+            synced_price = convert_quote_to_holding_currency(
+                db,
+                quote['price'],
+                quote.get('currency'),
+                holding['currency'],
+                base_currency,
+            )
+            db.execute(
+                '''UPDATE investment_holdings
+                   SET current_price = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND user_id = ?''',
+                (float(round(synced_price, 8)), holding['id'], current_user.id),
+            )
+            updated += 1
+        except Exception as exc:
+            failed.append(f"{holding['asset_name']}: {exc}")
+
+    db.commit()
+
+    if updated:
+        flash(f'Updated market prices for {updated} holding(s).', 'success')
+    if skipped:
+        flash(f'Skipped {len(skipped)} holding(s): ' + '; '.join(skipped[:5]), 'warning')
+    if failed:
+        flash(f'Failed {len(failed)} holding(s): ' + '; '.join(failed[:5]), 'warning')
+    if not (updated or skipped or failed):
+        flash('No holdings available for market sync.', 'info')
+
     return redirect(url_for('investments'))
 
 

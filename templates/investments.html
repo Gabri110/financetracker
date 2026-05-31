@@ -6,6 +6,11 @@
 <div class="page-header d-flex justify-content-between align-items-center">
     <h1><i class="bi bi-graph-up-arrow"></i> Investments</h1>
     <div class="d-flex gap-2">
+        <form method="POST" action="{{ url_for('sync_all_investment_prices') }}" class="d-inline">
+            <button type="submit" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-repeat"></i> Sync Market Prices
+            </button>
+        </form>
         <a href="{{ url_for('add_investment_account') }}" class="btn btn-outline-primary">
             <i class="bi bi-bank"></i> Add Investment Account
         </a>
@@ -135,7 +140,7 @@
                             <tr>
                                 <td>
                                     <div class="fw-semibold">{{ holding.asset_name }}</div>
-                                    <small class="text-muted">{{ holding.ticker or 'N/A' }} &middot; {{ holding.currency }}</small>
+                                    <small class="text-muted">{{ holding.ticker or holding.isin or 'N/A' }} &middot; {{ holding.currency }}</small>
                                 </td>
                                 <td>{{ holding.asset_class }}</td>
                                 <td>
@@ -170,6 +175,11 @@
                                     {% endif %}
                                 </td>
                                 <td class="text-end">
+                                    {% if holding.asset_class in market_syncable_classes and (holding.ticker or holding.isin) %}
+                                    <form method="POST" action="{{ url_for('sync_investment_holding_price', holding_id=holding.id) }}" class="d-inline">
+                                        <button type="submit" class="btn btn-sm btn-outline-primary">Sync</button>
+                                    </form>
+                                    {% endif %}
                                     <a href="{{ url_for('edit_investment_holding', holding_id=holding.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>
                                     <form method="POST" action="{{ url_for('delete_investment_holding', holding_id=holding.id) }}" class="d-inline"
                                           onsubmit="return confirm('Delete this holding and its linked operations?');">
