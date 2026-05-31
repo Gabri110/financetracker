@@ -123,10 +123,10 @@
                                 <th>Asset</th>
                                 <th>Class</th>
                                 <th>Account</th>
-                                <th class="text-end">Quantity</th>
-                                <th class="text-end">Avg Cost</th>
-                                <th class="text-end">Price</th>
-                                <th class="text-end">Unrealized</th>
+                                <th class="text-end">Value Invested</th>
+                                <th class="text-end">Current Value</th>
+                                <th class="text-end">Total Return</th>
+                                <th class="text-end">YTD Return</th>
                                 <th></th>
                             </tr>
                         </thead>
@@ -144,28 +144,30 @@
                                     <small class="text-muted">{{ (holding.account_income_profile or 'n/a') | capitalize }}</small>
                                 </td>
                                 <td class="text-end">
-                                    {% if holding.asset_class == 'Mintos Lending' %}
-                                    <span class="text-muted">Cash account</span>
-                                    {% else %}
-                                    {{ "{:.8f}".format(holding.quantity) }}
-                                    {% endif %}
+                                    {{ format_currency(holding.invested_value_base, base_currency) }}
                                 </td>
                                 <td class="text-end">
-                                    {% if holding.asset_class == 'Mintos Lending' %}
-                                    {{ format_currency(holding.cost_basis, holding.currency) }}
-                                    {% else %}
-                                    {{ format_currency(holding.avg_cost, holding.currency) }}
-                                    {% endif %}
+                                    {{ format_currency(holding.current_value_base, base_currency) }}
                                 </td>
-                                <td class="text-end">
-                                    {% if holding.asset_class == 'Mintos Lending' %}
-                                    {{ format_currency(holding.current_value, holding.currency) }}
+                                <td class="text-end {% if holding.total_return_abs_base >= 0 %}text-success{% else %}text-danger{% endif %}">
+                                    {{ format_currency(holding.total_return_abs_base, base_currency) }}
+                                    <br>
+                                    <small class="text-muted">
+                                        {% if holding.total_return_pct is not none %}
+                                        {{ "{:.2f}".format(holding.total_return_pct) }}%
                                     {% else %}
-                                    {{ format_currency(holding.current_price, holding.currency) }}
+                                        n/a
                                     {% endif %}
+                                    </small>
                                 </td>
-                                <td class="text-end {% if holding.unrealized_gain >= 0 %}text-success{% else %}text-danger{% endif %}">
-                                    {{ format_currency(holding.unrealized_gain, holding.currency) }}
+                                <td class="text-end {% if holding.ytd_return_pct is not none and holding.ytd_return_pct >= 0 %}text-success{% elif holding.ytd_return_pct is not none %}text-danger{% endif %}">
+                                    {% if holding.ytd_return_pct is not none %}
+                                    {{ "{:.2f}".format(holding.ytd_return_pct) }}%
+                                    <br>
+                                    <small class="text-muted">{{ format_currency(holding.ytd_return_base, base_currency) }}</small>
+                                    {% else %}
+                                    n/a
+                                    {% endif %}
                                 </td>
                                 <td class="text-end">
                                     <a href="{{ url_for('edit_investment_holding', holding_id=holding.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>

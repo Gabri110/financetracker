@@ -1165,6 +1165,52 @@ def build_investment_dashboard_data(db, user_id, base_currency):
     invested_capital = 0.0
     allocation_map = defaultdict(float)
     normalized_holdings = []
+    current_year = datetime.now().strftime('%Y')
+
+    operation_rows = db.execute(
+        '''SELECT holding_id, operation_type, amount, realized_gain, currency, operation_date
+           FROM investment_operations
+           WHERE user_id = ?
+             AND holding_id IS NOT NULL''',
+        (user_id,),
+    ).fetchall()
+
+    valuation_rows = db.execute(
+        '''SELECT holding_id, valuation_date, return_amount, currency
+           FROM investment_valuations
+           WHERE user_id = ?
+             AND holding_id IS NOT NULL''',
+        (user_id,),
+    ).fetchall()
+
+    all_time_map = defaultdict(float)
+    yearly_map = defaultdict(float)
+    for op in operation_rows:
+        contribution = 0.0
+        if op['operation_type'] == 'dividend':
+            contribution = convert_amount(db, op['amount'] or 0, op['currency'], base_currency)
+        elif op['operation_type'] == 'sell':
+            contribution = convert_amount(db, op['realized_gain'] or 0, op['currency'], base_currency)
+
+        if contribution == 0:
+            continue
+
+        holding_id = op['holding_id']
+        all_time_map[holding_id] += contribution
+        if (op['operation_date'] or '')[:4] == current_year:
+            yearly_map[holding_id] += contribution
+
+    for val in valuation_rows:
+        return_amount = val['return_amount']
+        if return_amount is None:
+            continue
+        contribution = convert_amount(db, return_amount, val['currency'], base_currency)
+        if contribution == 0:
+            continue
+        holding_id = val['holding_id']
+        all_time_map[holding_id] += contribution
+        if (val['valuation_date'] or '')[:4] == current_year:
+            yearly_map[holding_id] += contribution
 
     for row in holdings:
         current_value_dec, cost_basis_dec = get_holding_value_components(row)
@@ -1178,9 +1224,28 @@ def build_investment_dashboard_data(db, user_id, base_currency):
         allocation_map[row['asset_class']] += converted_current
 
         item = dict(row)
-        item['current_value'] = current_value
-        item['cost_basis'] = cost_basis
-        item['unrealized_gain'] = current_value - cost_basis
+        item['current_value'] = round(current_value, 2)
+        item['cost_basis'] = round(cost_basis, 2)
+        item['unrealized_gain'] = round(current_value - cost_basis, 2)
+        item['invested_value_base'] = round(converted_cost, 2)
+        item['current_value_base'] = round(converted_current, 2)
+        item['unrealized_gain_base'] = round(converted_current - converted_cost, 2)
+
+        if row['asset_class'] == 'Mintos Lending':
+            total_return_abs_base = converted_current - converted_cost
+        else:
+            total_return_abs_base = item['unrealized_gain_base'] + float(all_time_map[row['id']])
+        item['total_return_abs_base'] = round(total_return_abs_base, 2)
+        item['total_return_pct'] = round(total_return_abs_base / converted_cost * 100, 6) if converted_cost > 0 else None
+
+        ytd_return_base = float(yearly_map[row['id']])
+        created_year = (row['created_at'] or '')[:4]
+        # If a holding was created this year and has no explicit yearly return rows,
+        # use current total return as the YTD proxy.
+        if abs(ytd_return_base) < 1e-12 and created_year == current_year:
+            ytd_return_base = total_return_abs_base
+        item['ytd_return_base'] = round(ytd_return_base, 2)
+        item['ytd_return_pct'] = round(ytd_return_base / converted_cost * 100, 6) if converted_cost > 0 else None
         normalized_holdings.append(item)
 
     unrealized_gain = total_portfolio_value - invested_capital
@@ -2417,7 +2482,7 @@ def add_investment_evolution():
         (float(quantity_to_store), float(new_price), holding['id'], current_user.id),
     )
 
-    if computed_return_amount is not None and computed_return_amount > 0:
+    if computed_return_amount is not None and computed_return_amount != 0:
         db.execute(
             '''INSERT INTO investment_operations
                (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date)
