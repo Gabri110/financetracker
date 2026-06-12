@@ -58,7 +58,7 @@ pip install -r requirements.txt
 # Run the application
 python app.py
 
-# Open http://localhost:5000 in your browser
+# Open http://localhost:8000 in your browser
 ```
 
 ### Docker (Self-Hosted)
@@ -80,7 +80,7 @@ export STRIPE_SECRET_KEY=sk_live_...
 # Run the application
 python app.py
 
-# Open http://localhost:5000 to see landing page
+# Open http://localhost:8000 to see landing page
 ```
 
 ## Configuration

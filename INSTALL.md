@@ -13,7 +13,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The app will be available at `http://localhost:5000`. Register your first user account to get started. The SQLite database is created automatically at `finance.db` in the project root.
+The app will be available at `http://localhost:8000`. Register your first user account to get started. The SQLite database is created automatically at `finance.db` in the project root.
 
 ## Docker Self-Hosted
 

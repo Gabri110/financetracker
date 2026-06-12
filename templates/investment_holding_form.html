@@ -39,12 +39,12 @@
                             <input type="text" class="form-control" id="asset_name" name="asset_name" required
                                    value="{{ holding.asset_name if holding else '' }}" placeholder="e.g., Vanguard FTSE All-World ETF">
                         </div>
-                        <div class="col-md-3 mb-3">
+                        <div class="col-md-3 mb-3" id="ticker-wrapper">
                             <label for="ticker" class="form-label">Ticker</label>
                             <input type="text" class="form-control" id="ticker" name="ticker"
                                    value="{{ holding.ticker if holding else '' }}" placeholder="e.g., VWCE">
                         </div>
-                        <div class="col-md-3 mb-3">
+                        <div class="col-md-3 mb-3" id="isin-wrapper">
                             <label for="isin" class="form-label">ISIN</label>
                             <input type="text" class="form-control" id="isin" name="isin"
                                    value="{{ holding.isin if holding else '' }}" placeholder="e.g., IE00BK5BQT80">
@@ -84,7 +84,7 @@
                             <i class="bi bi-arrow-left"></i> Cancel
                         </a>
                         <div class="d-flex gap-2">
-                                {% if holding and (holding.ticker or holding.isin) and holding.asset_class in ['ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund'] %}
+                                    {% if holding and ((holding.asset_class == 'IF' and holding.isin) or (holding.asset_class != 'IF' and holding.ticker)) and holding.asset_class in ['ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund'] %}
                             <button type="submit" class="btn btn-outline-secondary"
                                     formmethod="POST"
                                     formaction="{{ url_for('sync_investment_holding_price', holding_id=holding.id) }}">
@@ -108,13 +108,44 @@
 (function () {
     const assetClass = document.getElementById('asset_class');
     const quantityInput = document.getElementById('quantity');
+    const tickerInput = document.getElementById('ticker');
+    const tickerWrapper = document.getElementById('ticker-wrapper');
+    const isinInput = document.getElementById('isin');
+    const isinWrapper = document.getElementById('isin-wrapper');
     const quantityLabel = document.getElementById('quantity-label');
     const quantityHelp = document.getElementById('quantity-help');
     const avgCostLabel = document.getElementById('avg-cost-label');
     const currentPriceLabel = document.getElementById('current-price-label');
 
+    function syncIdentifierMode(selectedClass) {
+        const isIf = selectedClass === 'IF';
+        const isMintos = selectedClass === 'Mintos Lending';
+
+        if (isIf) {
+            tickerWrapper.classList.add('d-none');
+            tickerInput.disabled = true;
+            isinWrapper.classList.remove('d-none');
+            isinInput.disabled = false;
+            return;
+        }
+
+        if (isMintos) {
+            tickerWrapper.classList.add('d-none');
+            tickerInput.disabled = true;
+            isinWrapper.classList.add('d-none');
+            isinInput.disabled = true;
+            return;
+        }
+
+        tickerWrapper.classList.remove('d-none');
+        tickerInput.disabled = false;
+        isinWrapper.classList.add('d-none');
+        isinInput.disabled = true;
+    }
+
     function syncMintosMode() {
         const isMintos = assetClass.value === 'Mintos Lending';
+        syncIdentifierMode(assetClass.value);
         if (isMintos) {
             quantityInput.value = '1';
             quantityInput.readOnly = true;

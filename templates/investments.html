@@ -140,7 +140,14 @@
                             <tr>
                                 <td>
                                     <div class="fw-semibold">{{ holding.asset_name }}</div>
-                                    <small class="text-muted">{{ holding.ticker or holding.isin or 'N/A' }} &middot; {{ holding.currency }}</small>
+                                    <small class="text-muted">
+                                        {% if holding.asset_class == 'IF' %}
+                                        {{ holding.isin or 'N/A' }}
+                                        {% else %}
+                                        {{ holding.ticker or 'N/A' }}
+                                        {% endif %}
+                                        &middot; {{ holding.currency }}
+                                    </small>
                                 </td>
                                 <td>{{ holding.asset_class }}</td>
                                 <td>
@@ -175,7 +182,7 @@
                                     {% endif %}
                                 </td>
                                 <td class="text-end">
-                                    {% if holding.asset_class in market_syncable_classes and (holding.ticker or holding.isin) %}
+                                    {% if holding.asset_class in market_syncable_classes and ((holding.asset_class == 'IF' and holding.isin) or (holding.asset_class != 'IF' and holding.ticker)) %}
                                     <form method="POST" action="{{ url_for('sync_investment_holding_price', holding_id=holding.id) }}" class="d-inline">
                                         <button type="submit" class="btn btn-sm btn-outline-primary">Sync</button>
                                     </form>

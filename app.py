@@ -17,6 +17,7 @@ from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 
 from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file
+from flask import has_app_context
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -311,6 +312,13 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id),
             FOREIGN KEY (holding_id) REFERENCES investment_holdings (id)
         );
+
+        CREATE TABLE IF NOT EXISTS market_symbol_cache (
+            identifier TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            source TEXT DEFAULT 'yahoo',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     ''')
 
     # Add optional external transaction reference used by CSV imports.
@@ -496,6 +504,58 @@ def set_cached_item(cache_store, key, value):
     }
 
 
+def parse_db_timestamp(timestamp_text):
+    if not timestamp_text:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+        try:
+            return datetime.strptime(timestamp_text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def get_persisted_symbol(identifier, ttl_seconds):
+    if not has_app_context():
+        return None
+
+    db = get_db()
+    row = db.execute(
+        'SELECT symbol, updated_at FROM market_symbol_cache WHERE identifier = ?',
+        (identifier,),
+    ).fetchone()
+    if not row:
+        return None
+
+    updated_at = parse_db_timestamp(row['updated_at'])
+    if not updated_at:
+        return normalize_ticker_symbol(row['symbol'])
+
+    if (datetime.now() - updated_at).total_seconds() > ttl_seconds:
+        db.execute('DELETE FROM market_symbol_cache WHERE identifier = ?', (identifier,))
+        db.commit()
+        return None
+
+    return normalize_ticker_symbol(row['symbol'])
+
+
+def persist_symbol(identifier, symbol, source='yahoo'):
+    if not has_app_context():
+        return
+
+    db = get_db()
+    db.execute(
+        '''INSERT INTO market_symbol_cache (identifier, symbol, source, updated_at)
+           VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(identifier)
+           DO UPDATE SET symbol = excluded.symbol,
+                         source = excluded.source,
+                         updated_at = CURRENT_TIMESTAMP''',
+        (identifier, symbol, source),
+    )
+    db.commit()
+
+
 def fetch_json_with_headers(url):
     request_obj = urllib_request.Request(url, headers=HTTP_BROWSER_HEADERS)
     with urllib_request.urlopen(request_obj, timeout=8) as response:
@@ -586,6 +646,11 @@ def resolve_yahoo_symbol(identifier):
     if cached_symbol:
         return cached_symbol
 
+    persisted_symbol = get_persisted_symbol(normalized, YAHOO_SYMBOL_CACHE_TTL_SECONDS)
+    if persisted_symbol:
+        set_cached_item(YAHOO_SYMBOL_CACHE, normalized, persisted_symbol)
+        return persisted_symbol
+
     errors = []
     for template in (YAHOO_SEARCH_URL, YAHOO_SEARCH_URL_ALT):
         url = template.format(query=quote_plus(normalized))
@@ -595,6 +660,7 @@ def resolve_yahoo_symbol(identifier):
                 symbol = normalize_ticker_symbol(quote.get('symbol'))
                 if symbol:
                     set_cached_item(YAHOO_SYMBOL_CACHE, normalized, symbol)
+                    persist_symbol(normalized, symbol, source='yahoo')
                     return symbol
         except HTTPError as exc:
             errors.append(str(exc))
@@ -2215,8 +2281,8 @@ def add_investment_holding():
                 investment_accounts=investment_accounts,
                 asset_classes=INVESTMENT_ASSET_CLASSES,
             )
-        if asset_class == 'IF' and not (isin or ticker):
-            flash('IF holdings require an ISIN or ticker.', 'danger')
+        if asset_class == 'IF' and not isin:
+            flash('IF holdings require an ISIN.', 'danger')
             return render_template(
                 'investment_holding_form.html',
                 holding=None,
@@ -2321,8 +2387,8 @@ def edit_investment_holding(holding_id):
                 investment_accounts=investment_accounts,
                 asset_classes=INVESTMENT_ASSET_CLASSES,
             )
-        if asset_class == 'IF' and not (isin or ticker):
-            flash('IF holdings require an ISIN or ticker.', 'danger')
+        if asset_class == 'IF' and not isin:
+            flash('IF holdings require an ISIN.', 'danger')
             return render_template(
                 'investment_holding_form.html',
                 holding=holding,
