@@ -1,0 +1,253 @@
+{% extends "base.html" %}
+
+{% block title %}Bank Import - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1><i class="bi bi-bank2"></i> Bank Import</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-10 col-lg-8">
+
+        {% if not accounts %}
+        <div class="alert alert-warning">
+            <i class="bi bi-exclamation-triangle"></i>
+            You need to create an account first before importing transactions.
+            <a href="{{ url_for('add_account') }}">Create Account</a>
+        </div>
+        {% else %}
+
+        {% for source_key, source in sources.items() %}
+        {% set settings = source.settings %}
+        <div class="card mb-4">
+            <div class="card-header">
+                <i class="bi bi-bank"></i> {{ source.label }}
+            </div>
+            <div class="card-body">
+                {% if source.error %}
+                <div class="alert alert-danger">
+                    <i class="bi bi-exclamation-triangle"></i> {{ source.error }}
+                </div>
+                {% endif %}
+
+                <div class="mb-3">
+                    <span class="form-label fw-bold">Detected files (all are processed, newest wins on overlaps)</span>
+                    {% if source.files %}
+                    <ul class="small mb-0">
+                        {% for file in source.files %}
+                        <li><code>{{ file }}</code></li>
+                        {% endfor %}
+                    </ul>
+                    {% else %}
+                    <div class="form-text">No CSV files found in <code>data/raw/{{ source_key }}/</code>. Upload one below.</div>
+                    {% endif %}
+                </div>
+
+                <form method="POST" action="{{ url_for('bank_import_preview') }}" enctype="multipart/form-data">
+                    <input type="hidden" name="source" value="{{ source_key }}">
+
+                    <div class="mb-3">
+                        <label class="form-label">Add another export (optional)</label>
+                        <input type="file" class="form-control" name="new_file" accept=".csv">
+                    </div>
+
+                    {% if source_key == 'revolut' %}
+                    {% if source.currencies %}
+                    <div class="mb-3">
+                        <span class="form-label fw-bold">Currencies found</span>
+                        <div class="form-text mb-2">Each enabled currency is merged (current account + vaults) into the selected account.</div>
+                        {% for entry in source.currencies %}
+                        {% set currency = entry.currency %}
+                        <input type="hidden" name="currencies" value="{{ currency }}">
+                        <div class="row g-2 align-items-center mb-2">
+                            <div class="col-auto">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="enabled_{{ currency }}" name="enabled_{{ currency }}"
+                                           {% if (settings.enabled_currencies and currency in settings.enabled_currencies)
+                                                 or (not settings.enabled_currencies and not settings.currency_accounts) %}checked{% endif %}>
+                                    <label class="form-check-label" for="enabled_{{ currency }}">
+                                        <strong>{{ currency }}</strong> <span class="text-muted small">({{ entry.count }} rows)</span>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <select class="form-select form-select-sm" name="account_{{ currency }}">
+                                    <option value="">Skip — no account</option>
+                                    {% for account in accounts %}
+                                    <option value="{{ account.id }}"
+                                            {% if settings.currency_accounts and settings.currency_accounts.get(currency)|string == account.id|string %}selected{% endif %}>
+                                        {{ account.name }} ({{ account.currency }}, {{ account.account_type | capitalize }})
+                                    </option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                    {% else %}
+                    <div class="mb-3">
+                        <label class="form-label">Cash account *</label>
+                        <select class="form-select" name="account_id" required>
+                            <option value="">Select account...</option>
+                            {% for account in accounts %}
+                            <option value="{{ account.id }}"
+                                    {% if settings.account_id|string == account.id|string %}selected{% endif %}>
+                                {{ account.name }} ({{ account.currency }}, {{ account.account_type | capitalize }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="create_investments_{{ source_key }}" name="create_investments"
+                                   {% if settings.create_investments or settings.create_investments is not defined %}checked{% endif %}>
+                            <label class="form-check-label" for="create_investments_{{ source_key }}">
+                                Also create investment operations (settled BUY rows with shares &amp; price)
+                            </label>
+                        </div>
+                        <select class="form-select mt-2" name="investment_account_id">
+                            <option value="">Select investment account...</option>
+                            {% for account in investment_accounts %}
+                            <option value="{{ account.id }}"
+                                    {% if settings.investment_account_id|string == account.id|string %}selected{% endif %}>
+                                {{ account.name }} ({{ account.currency }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                        {% if not investment_accounts %}
+                        <div class="form-text">No dashboard investment accounts exist yet — create one under Investments.</div>
+                        {% endif %}
+                    </div>
+                    {% endif %}
+
+                    <div class="mb-3">
+                        <label class="form-label">Only import from date (optional)</label>
+                        <input type="date" class="form-control" name="from_date" value="{{ settings.from_date or '' }}">
+                        <div class="form-text">Re-importing overlapping data is safe: rows are matched by transaction ID.</div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" {% if not source.files %}disabled{% endif %}>
+                        <i class="bi bi-search"></i> Preview Import
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        {% if preview and preview_source == source_key %}
+        <div class="card mb-4 border-primary">
+            <div class="card-header bg-primary text-white">
+                <i class="bi bi-clipboard-check"></i> Preview — {{ preview.label }}
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm small">
+                        <thead>
+                            <tr>
+                                <th>Currency</th>
+                                <th>Rows</th>
+                                <th>To import</th>
+                                <th>Account</th>
+                                <th>Income</th>
+                                <th>Expenses</th>
+                                <th>Transfers</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for stats in preview.currencies %}
+                            <tr {% if not stats.enabled or not stats.account_id %}class="text-muted"{% endif %}>
+                                <td><strong>{{ stats.currency }}</strong></td>
+                                <td>{{ stats.count }}</td>
+                                <td>{{ stats.kept }}</td>
+                                <td>
+                                    {% if stats.enabled and stats.account_id %}
+                                    {{ stats.account_name }}
+                                    {% if stats.currency_mismatch %}
+                                    <span class="badge bg-warning text-dark" title="Account currency differs from the CSV currency">currency mismatch</span>
+                                    {% endif %}
+                                    {% else %}
+                                    <em>skipped — {% if not stats.enabled %}disabled{% else %}no account mapped{% endif %}</em>
+                                    {% endif %}
+                                </td>
+                                <td>{% if stats.kept %}{{ format_currency(stats.income, stats.currency) }}{% else %}—{% endif %}</td>
+                                <td>{% if stats.kept %}{{ format_currency(stats.expense, stats.currency) }}{% else %}—{% endif %}</td>
+                                <td>{{ stats.transfers }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                <ul class="small mb-3">
+                    {% for file in preview.files %}
+                    <li><code>{{ file.name }}</code>: {{ file.row_count }} usable rows</li>
+                    {% endfor %}
+                    {% if preview.cross_file_duplicates %}
+                    <li>{{ preview.cross_file_duplicates }} rows appeared in several files (newest file used)</li>
+                    {% endif %}
+                    {% for state, count in preview.skipped_states.items() %}
+                    <li>{{ count }} rows skipped ({{ state }})</li>
+                    {% endfor %}
+                    {% if preview.skipped_before_date %}
+                    <li>{{ preview.skipped_before_date }} rows skipped (before from-date)</li>
+                    {% endif %}
+                    {% if preview.legacy_matches %}
+                    <li>{{ preview.legacy_matches }} previously imported transactions will be migrated to the new IDs (no duplicates)</li>
+                    {% endif %}
+                </ul>
+
+                {% if preview.investment_plan %}
+                <div class="alert alert-info small">
+                    <strong>Investments → {{ preview.investment_plan.account_name }}:</strong>
+                    {{ preview.investment_plan.new_count }} new operations,
+                    {{ preview.investment_plan.existing_count }} already imported.
+                    {% if preview.investment_plan.new_holdings %}
+                    New holdings: {{ preview.investment_plan.new_holdings | join(', ') }}.
+                    {% endif %}
+                </div>
+                {% endif %}
+
+                {% if preview.samples %}
+                <h6 class="small fw-bold">Most recent rows</h6>
+                <div class="table-responsive mb-3">
+                    <table class="table table-sm small">
+                        <thead>
+                            <tr><th>Date</th><th>Type</th><th>Amount</th><th>Category</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for row in preview.samples %}
+                            <tr>
+                                <td>{{ row.date }}</td>
+                                <td>{{ row.transaction_type }}</td>
+                                <td>{{ format_currency(row.amount, row.currency) }}</td>
+                                <td>{{ row.category_text }}</td>
+                                <td class="text-truncate" style="max-width: 280px;">{{ row.description }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+
+                <form method="POST" action="{{ url_for('bank_import_confirm') }}">
+                    <input type="hidden" name="source" value="{{ preview_source }}">
+                    <input type="hidden" name="settings_json" value="{{ preview_settings_json }}">
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('bank_import') }}" class="btn btn-outline-secondary">
+                            <i class="bi bi-x-lg"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-success" {% if not preview.rows %}disabled{% endif %}>
+                            <i class="bi bi-check2-circle"></i> Import {{ preview.rows | length }} Transactions
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+        {% endfor %}
+
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

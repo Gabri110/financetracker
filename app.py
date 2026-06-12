@@ -20,6 +20,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, g, 
 from flask import has_app_context
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 # Use pbkdf2 method since scrypt may not be available on all systems
 def hash_password(password):
@@ -43,6 +44,25 @@ INVESTMENT_ASSET_CLASSES = (
 )
 INVESTMENT_INCOME_PROFILES = ('fixed', 'variable')
 INVESTMENT_MARKET_SYNCABLE_CLASSES = ('ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund')
+BANK_IMPORT_SOURCES = {
+    'revolut': os.path.join('data', 'raw', 'revolut'),
+    'trade_republic': os.path.join('data', 'raw', 'trade_republic'),
+}
+BANK_IMPORT_SOURCE_LABELS = {
+    'revolut': 'Revolut',
+    'trade_republic': 'Trade Republic',
+}
+TRADE_REPUBLIC_INCOME_TYPES = {
+    'TRANSFER_INBOUND',
+    'TRANSFER_INSTANT_INBOUND',
+    'INTEREST_PAYMENT',
+    'BENEFITS_SAVEBACK',
+}
+TRADE_REPUBLIC_BUY_TYPES = {'BUY', 'PRIVATE_MARKET_BUY'}
+TRADE_REPUBLIC_ASSET_CLASS_MAP = {
+    'MUTUAL_FUND': 'IF',
+    'PRIVATE_FUND': 'Private Equity Fund',
+}
 STOOQ_QUOTE_URL = 'https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv'
 YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
 YAHOO_CHART_URL_ALT = 'https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
@@ -319,6 +339,15 @@ def init_db():
             source TEXT DEFAULT 'yahoo',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER NOT NULL,
+            setting_key TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, setting_key),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        );
     ''')
 
     # Add optional external transaction reference used by CSV imports.
@@ -348,6 +377,13 @@ def init_db():
     if 'isin' not in holding_columns:
         db.execute('ALTER TABLE investment_holdings ADD COLUMN isin TEXT')
 
+    # External reference used by bank imports to make operation creation idempotent.
+    operation_columns = {
+        row['name'] for row in db.execute('PRAGMA table_info(investment_operations)').fetchall()
+    }
+    if 'id_transaction' not in operation_columns:
+        db.execute('ALTER TABLE investment_operations ADD COLUMN id_transaction TEXT')
+
     db.commit()
 
 
@@ -360,6 +396,29 @@ def get_user_base_currency(user_id):
     if not row:
         return DEFAULT_BASE_CURRENCY
     return normalize_currency(row['base_currency'])
+
+
+def get_user_setting(db, user_id, key, default=None):
+    row = db.execute(
+        'SELECT value_json FROM user_settings WHERE user_id = ? AND setting_key = ?',
+        (user_id, key),
+    ).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row['value_json'])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_user_setting(db, user_id, key, value):
+    db.execute(
+        '''INSERT INTO user_settings (user_id, setting_key, value_json)
+           VALUES (?, ?, ?)
+           ON CONFLICT(user_id, setting_key)
+           DO UPDATE SET value_json = excluded.value_json, updated_at = CURRENT_TIMESTAMP''',
+        (user_id, key, json.dumps(value)),
+    )
 
 
 def fetch_ecb_rates_for_base(base_currency):
@@ -3185,6 +3244,803 @@ def delete_transaction(transaction_id):
 
 
 # Import routes
+# ---------------------------------------------------------------------------
+# Bank import: raw exports dropped in data/raw/<source>/ are parsed, previewed
+# and ingested as transactions (and investment operations for Trade Republic).
+# ---------------------------------------------------------------------------
+
+def parse_bank_export_date(value):
+    """Return YYYY-MM-DD from a raw export timestamp, or '' when unparseable."""
+    text = (value or '').strip()
+    if len(text) >= 10:
+        candidate = text[:10]
+        try:
+            datetime.strptime(candidate, '%Y-%m-%d')
+            return candidate
+        except ValueError:
+            pass
+    return ''
+
+
+def parse_revolut_csv(csv_text):
+    """Parse a raw Revolut export (all currencies/sub-accounts) into normalized rows."""
+    # Revolut exports are always comma-delimited; descriptions may contain ';',
+    # so the generic delimiter sniffing helpers must not be used here.
+    reader = csv.DictReader(io.StringIO(csv_text))
+
+    skipped = defaultdict(int)
+    completed_rows = []
+    for row in reader:
+        if not (row.get('id') or '').strip():
+            continue
+        state = (row.get('state') or '').strip().upper()
+        if state and state != 'COMPLETED':
+            skipped[state] += 1
+            continue
+        completed_rows.append(row)
+
+    # Same-currency TRANSFER pairs (vault moves) share one Revolut id: both legs
+    # are internal and should be typed 'transfer'.
+    pair_counts = defaultdict(int)
+    for row in completed_rows:
+        if (row.get('type') or '').strip().upper() == 'TRANSFER':
+            pair_counts[((row.get('id') or '').strip(), normalize_currency(row.get('currency')))] += 1
+
+    rows = []
+    for row in completed_rows:
+        raw_id = (row.get('id') or '').strip()
+        leg_id = (row.get('legId') or '').strip() or raw_id
+
+        date = (
+            parse_bank_export_date(row.get('completedDate'))
+            or parse_bank_export_date(row.get('startedDate'))
+            or parse_bank_export_date(row.get('createdDate'))
+        )
+        if not date:
+            skipped['NO_DATE'] += 1
+            continue
+
+        # Amounts are in minor units; amountWithCharges already nets out fees.
+        raw_amount = (row.get('amountWithCharges') or '').strip() or (row.get('amount') or '').strip() or '0'
+        try:
+            amount = (Decimal(raw_amount) / Decimal('100')).quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        row_type = (row.get('type') or '').strip().upper()
+        currency = normalize_currency(row.get('currency'))
+        if row_type == 'EXCHANGE' or (row_type == 'TRANSFER' and pair_counts.get((raw_id, currency), 0) >= 2):
+            transaction_type = 'transfer'
+        else:
+            transaction_type = 'income' if amount >= 0 else 'expense'
+
+        description = (row.get('description') or '').strip()
+        comment = (row.get('comment') or '').strip()
+        reason = (row.get('reason') or '').strip()
+        memo_parts = [description] if description else []
+        if comment and comment != description:
+            memo_parts.append(comment)
+        if reason:
+            memo_parts.append(f'[{reason}]')
+
+        rows.append({
+            # legId (unique per leg) — using id would collapse exchange/vault pairs.
+            'id_transaction': f'rev_{leg_id}',
+            # Raw Revolut id: matches transactions imported by the old converter script.
+            'legacy_id': raw_id or None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': currency,
+            'category_text': (row.get('category') or '').strip() or (row.get('merchant_category') or '').strip(),
+            'description': ' | '.join(memo_parts),
+            'payee': (row.get('merchant_name') or '').strip(),
+        })
+
+    return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def parse_trade_republic_csv(csv_text):
+    """Parse a Trade Republic export into cash rows plus investment buy rows."""
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    investment_rows = []
+    skipped = defaultdict(int)
+
+    for row in reader:
+        raw_id = (row.get('id_transaction') or '').strip()
+        date = parse_bank_export_date(row.get('date')) or parse_bank_export_date(row.get('datetime'))
+        if not raw_id or not date:
+            skipped['NO_ID_OR_DATE'] += 1
+            continue
+
+        try:
+            amount = Decimal((row.get('amount') or '').strip() or '0').quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        row_type = (row.get('type') or '').strip().upper()
+        if row_type in TRADE_REPUBLIC_BUY_TYPES:
+            # Cash leg of a security purchase: typed transfer so it stays out of
+            # income/expense reports (the holding tracks the value instead).
+            transaction_type = 'transfer'
+        elif row_type in TRADE_REPUBLIC_INCOME_TYPES:
+            transaction_type = 'income'
+        else:
+            transaction_type = 'income' if amount >= 0 else 'expense'
+
+        id_transaction = f'tr_{raw_id}'
+        rows.append({
+            'id_transaction': id_transaction,
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': normalize_currency(row.get('currency')),
+            'category_text': (row.get('category') or '').strip(),
+            'description': (row.get('description') or '').strip(),
+            'payee': (row.get('counterparty_name') or '').strip() or (row.get('name') or '').strip(),
+        })
+
+        # Only settled BUY rows (shares + price) become investment operations.
+        # PRIVATE_MARKET_BUY rows are cash pre-payments that are settled later by
+        # a BUY row for the same ISIN — creating units from them would double-count.
+        if (
+            row_type == 'BUY'
+            and (row.get('symbol') or '').strip()
+            and (row.get('shares') or '').strip()
+            and (row.get('price') or '').strip()
+        ):
+            investment_rows.append({
+                'id_transaction': id_transaction,
+                'date': date,
+                'operation': row_type,
+                'asset_class': (row.get('asset_class') or '').strip().upper(),
+                'name': (row.get('name') or '').strip(),
+                'symbol': normalize_isin(row.get('symbol')),
+                'shares': (row.get('shares') or '').strip(),
+                'price': (row.get('price') or '').strip(),
+                'amount': abs(amount),
+                'currency': normalize_currency(row.get('currency')),
+            })
+
+    return {'rows': rows, 'investment_rows': investment_rows, 'skipped': dict(skipped)}
+
+
+BANK_IMPORT_PARSERS = {
+    'revolut': parse_revolut_csv,
+    'trade_republic': parse_trade_republic_csv,
+}
+
+
+def list_bank_import_files(source):
+    folder = BANK_IMPORT_SOURCES[source]
+    if not os.path.isdir(folder):
+        return []
+    return sorted(
+        name for name in os.listdir(folder)
+        if name.lower().endswith('.csv') and os.path.isfile(os.path.join(folder, name))
+    )
+
+
+def load_bank_source_rows(source):
+    """Parse and merge every CSV found for a source; newest file wins per id."""
+    parser = BANK_IMPORT_PARSERS[source]
+
+    merged_rows = {}
+    merged_investments = {}
+    skipped = defaultdict(int)
+    file_summaries = []
+    duplicate_count = 0
+
+    # Sorted ascending: filenames carry the export date, so later files override
+    # overlapping ids from earlier exports.
+    for name in list_bank_import_files(source):
+        path = os.path.join(BANK_IMPORT_SOURCES[source], name)
+        try:
+            with open(path, encoding='utf-8-sig', newline='') as handle:
+                parsed = parser(handle.read())
+        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            raise ValueError(f'Could not read {name}: {exc}')
+
+        for state, count in parsed['skipped'].items():
+            skipped[state] += count
+        for row in parsed['rows']:
+            if row['id_transaction'] in merged_rows:
+                duplicate_count += 1
+            merged_rows[row['id_transaction']] = row
+        for inv_row in parsed['investment_rows']:
+            merged_investments[inv_row['id_transaction']] = inv_row
+
+        file_summaries.append({'name': name, 'row_count': len(parsed['rows'])})
+
+    return {
+        'files': file_summaries,
+        'rows': sorted(merged_rows.values(), key=lambda row: (row['date'], row['id_transaction'])),
+        'investment_rows': sorted(merged_investments.values(), key=lambda row: (row['date'], row['id_transaction'])),
+        'skipped': dict(skipped),
+        'cross_file_duplicates': duplicate_count,
+    }
+
+
+def build_bank_import_plan(db, user_id, source, settings):
+    """Load all source files, apply settings, and return everything the preview
+    shows and the confirm step executes (single shared code path)."""
+    data = load_bank_source_rows(source)
+    accounts = {
+        account['id']: account
+        for account in db.execute('SELECT * FROM accounts WHERE user_id = ?', (user_id,)).fetchall()
+    }
+
+    from_date = (settings.get('from_date') or '').strip()
+    currency_accounts = settings.get('currency_accounts') or {}
+    enabled_currencies = set(settings.get('enabled_currencies') or [])
+
+    prepared = []
+    currency_stats = {}
+    skipped_unmapped = 0
+    skipped_before_date = 0
+
+    for row in data['rows']:
+        currency = row['currency']
+        stats = currency_stats.setdefault(currency, {
+            'currency': currency,
+            'count': 0,
+            'kept': 0,
+            'income': Decimal('0'),
+            'expense': Decimal('0'),
+            'transfers': 0,
+            'account_id': None,
+            'account_name': None,
+            'enabled': False,
+            'currency_mismatch': False,
+        })
+        stats['count'] += 1
+
+        if source == 'revolut':
+            account_id = currency_accounts.get(currency)
+            enabled = currency in enabled_currencies
+        else:
+            account_id = settings.get('account_id')
+            enabled = True
+
+        account = accounts.get(account_id) if account_id else None
+        if account:
+            stats['account_id'] = account['id']
+            stats['account_name'] = account['name']
+            stats['currency_mismatch'] = normalize_currency(account['currency']) != currency
+        stats['enabled'] = enabled
+
+        if not account or not enabled:
+            skipped_unmapped += 1
+            continue
+        if from_date and row['date'] < from_date:
+            skipped_before_date += 1
+            continue
+
+        stats['kept'] += 1
+        if row['transaction_type'] == 'income':
+            stats['income'] += row['amount']
+        elif row['transaction_type'] == 'expense':
+            stats['expense'] += row['amount']
+        else:
+            stats['transfers'] += 1
+
+        prepared.append({**row, 'account_id': account['id']})
+
+    # Count old-script imports (raw Revolut id) that the confirm step will
+    # migrate in place to the new legId-based ids.
+    legacy_matches = 0
+    if source == 'revolut' and prepared:
+        mapped_account_ids = {row['account_id'] for row in prepared}
+        placeholders = ','.join('?' for _ in mapped_account_ids)
+        existing_ids = {
+            row['id_transaction'] for row in db.execute(
+                f'''SELECT id_transaction FROM transactions
+                    WHERE user_id = ? AND account_id IN ({placeholders})
+                      AND id_transaction IS NOT NULL''',
+                (user_id, *mapped_account_ids),
+            ).fetchall()
+        }
+        seen_legacy = set()
+        for row in prepared:
+            legacy_id = row.get('legacy_id')
+            if (
+                legacy_id
+                and legacy_id not in seen_legacy
+                and row['id_transaction'] not in existing_ids
+                and legacy_id in existing_ids
+            ):
+                legacy_matches += 1
+                seen_legacy.add(legacy_id)
+
+    investment_plan = None
+    if source == 'trade_republic' and settings.get('create_investments') and settings.get('investment_account_id'):
+        investment_account_id = settings['investment_account_id']
+        investment_rows = [
+            row for row in data['investment_rows']
+            if not from_date or row['date'] >= from_date
+        ]
+        existing_ops = {
+            row['id_transaction'] for row in db.execute(
+                '''SELECT id_transaction FROM investment_operations
+                   WHERE user_id = ? AND id_transaction IS NOT NULL''',
+                (user_id,),
+            ).fetchall()
+        }
+        existing_isins = {
+            normalize_isin(row['isin']) for row in db.execute(
+                'SELECT isin FROM investment_holdings WHERE user_id = ? AND account_id = ?',
+                (user_id, investment_account_id),
+            ).fetchall() if row['isin']
+        }
+        new_rows = [row for row in investment_rows if row['id_transaction'] not in existing_ops]
+        investment_account = accounts.get(investment_account_id)
+        investment_plan = {
+            'account_id': investment_account_id,
+            'account_name': investment_account['name'] if investment_account else None,
+            'rows': investment_rows,
+            'new_count': len(new_rows),
+            'existing_count': len(investment_rows) - len(new_rows),
+            'new_holdings': sorted({
+                f"{row['name'] or row['symbol']} ({row['symbol']})"
+                for row in new_rows if row['symbol'] not in existing_isins
+            }),
+        }
+
+    samples = list(reversed(prepared[-10:]))
+    return {
+        'source': source,
+        'label': BANK_IMPORT_SOURCE_LABELS[source],
+        'files': data['files'],
+        'cross_file_duplicates': data['cross_file_duplicates'],
+        'skipped_states': data['skipped'],
+        'currencies': sorted(currency_stats.values(), key=lambda stats: -stats['count']),
+        'rows': prepared,
+        'skipped_unmapped': skipped_unmapped,
+        'skipped_before_date': skipped_before_date,
+        'legacy_matches': legacy_matches,
+        'investment_plan': investment_plan,
+        'samples': samples,
+    }
+
+
+def upsert_bank_transactions(db, user_id, prepared_rows):
+    """Insert/update normalized bank rows. Matches by id_transaction (user-wide,
+    so remapping a currency to another account moves rows instead of duplicating
+    them), falling back to the old converter script's raw Revolut id, which is
+    migrated in place to the new id."""
+    categories = db.execute(
+        'SELECT * FROM categories WHERE user_id = ? ORDER BY category_type, name',
+        (user_id,),
+    ).fetchall()
+    categories_by_id = {cat['id']: cat for cat in categories}
+
+    imported = 0
+    updated = 0
+    migrated = 0
+    errors = []
+
+    for row in prepared_rows:
+        try:
+            category_text = row['category_text']
+            matched_category_id = auto_categorize_transaction(
+                user_id, row['description'], row['payee'] or category_text
+            )
+            if not matched_category_id and category_text:
+                for cat in categories:
+                    if cat['name'].lower() in category_text.lower() or category_text.lower() in cat['name'].lower():
+                        matched_category_id = cat['id']
+                        break
+
+            transaction_type = row['transaction_type']
+            matched_category = categories_by_id.get(matched_category_id)
+            # Transfer-like categories force transfer type, but never downgrade a
+            # row the parser already marked as transfer.
+            if transaction_type != 'transfer' and (
+                (matched_category and matched_category['category_type'] == 'transfer')
+                or is_transfer_like_category(category_text)
+            ):
+                transaction_type = 'transfer'
+
+            amount = float(abs(row['amount']))
+
+            existing = db.execute(
+                'SELECT id FROM transactions WHERE user_id = ? AND id_transaction = ? ORDER BY id DESC',
+                (user_id, row['id_transaction']),
+            ).fetchall()
+            is_migration = False
+            if not existing and row.get('legacy_id'):
+                existing = db.execute(
+                    'SELECT id FROM transactions WHERE user_id = ? AND id_transaction = ? ORDER BY id DESC',
+                    (user_id, row['legacy_id']),
+                ).fetchall()
+                is_migration = bool(existing)
+
+            if existing:
+                keep_id = existing[0]['id']
+                db.execute(
+                    '''UPDATE transactions
+                       SET account_id = ?, category_id = ?, transaction_type = ?, amount = ?,
+                           description = ?, payee = ?, date = ?, id_transaction = ?
+                       WHERE id = ? AND user_id = ?''',
+                    (
+                        row['account_id'],
+                        matched_category_id,
+                        transaction_type,
+                        amount,
+                        row['description'],
+                        row['payee'],
+                        row['date'],
+                        row['id_transaction'],
+                        keep_id,
+                        user_id,
+                    ),
+                )
+                # Clean up any older duplicates for the same id_transaction.
+                for duplicate_row in existing[1:]:
+                    db.execute(
+                        'DELETE FROM transactions WHERE id = ? AND user_id = ?',
+                        (duplicate_row['id'], user_id),
+                    )
+                if is_migration:
+                    migrated += 1
+                else:
+                    updated += 1
+            else:
+                db.execute(
+                    '''INSERT INTO transactions
+                       (user_id, account_id, category_id, transaction_type, amount,
+                        description, payee, date, id_transaction)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        user_id,
+                        row['account_id'],
+                        matched_category_id,
+                        transaction_type,
+                        amount,
+                        row['description'],
+                        row['payee'],
+                        row['date'],
+                        row['id_transaction'],
+                    ),
+                )
+                imported += 1
+        except Exception as exc:
+            errors.append(f"{row.get('id_transaction', '?')}: {exc}")
+
+    return imported, updated, migrated, errors
+
+
+def import_tr_investment_ops(db, user_id, investment_account_id, investment_rows):
+    """Create buy operations (and holdings as needed) from Trade Republic rows.
+    Idempotent via investment_operations.id_transaction."""
+    ops_created = 0
+    ops_skipped = 0
+    holdings_created = 0
+
+    for row in investment_rows:
+        existing = db.execute(
+            'SELECT id FROM investment_operations WHERE user_id = ? AND id_transaction = ?',
+            (user_id, row['id_transaction']),
+        ).fetchone()
+        if existing:
+            ops_skipped += 1
+            continue
+
+        try:
+            quantity = Decimal(row['shares']).quantize(DECIMAL_QUANTITY_PLACES)
+            price = Decimal(row['price']).quantize(DECIMAL_MONEY_PLACES)
+        except InvalidOperation:
+            ops_skipped += 1
+            continue
+        if quantity <= 0 or price <= 0 or not row['symbol']:
+            ops_skipped += 1
+            continue
+        amount = (quantity * price).quantize(DECIMAL_MONEY_PLACES)
+
+        holding = db.execute(
+            'SELECT * FROM investment_holdings WHERE user_id = ? AND account_id = ? AND isin = ?',
+            (user_id, investment_account_id, row['symbol']),
+        ).fetchone()
+        if not holding:
+            asset_class = TRADE_REPUBLIC_ASSET_CLASS_MAP.get(row['asset_class'], 'ETF')
+            cursor = db.execute(
+                '''INSERT INTO investment_holdings
+                   (user_id, account_id, asset_name, ticker, isin, asset_class, currency,
+                    quantity, avg_cost, current_price, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, CURRENT_TIMESTAMP)''',
+                (
+                    user_id,
+                    investment_account_id,
+                    row['name'] or row['symbol'],
+                    '',
+                    row['symbol'],
+                    asset_class,
+                    row['currency'],
+                ),
+            )
+            holding = db.execute(
+                'SELECT * FROM investment_holdings WHERE id = ?', (cursor.lastrowid,)
+            ).fetchone()
+            holdings_created += 1
+
+        old_qty = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
+        old_avg = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+        new_qty = (old_qty + quantity).quantize(DECIMAL_QUANTITY_PLACES)
+        new_avg = (((old_qty * old_avg) + (quantity * price)) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
+        db.execute(
+            '''UPDATE investment_holdings
+               SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?''',
+            (float(new_qty), float(new_avg), float(price), holding['id'], user_id),
+        )
+        db.execute(
+            '''INSERT INTO investment_operations
+               (user_id, account_id, holding_id, operation_type, quantity, price_per_unit,
+                amount, currency, is_reinvested, realized_gain, note, operation_date, id_transaction)
+               VALUES (?, ?, ?, 'buy', ?, ?, ?, ?, 0, NULL, ?, ?, ?)''',
+            (
+                user_id,
+                investment_account_id,
+                holding['id'],
+                float(quantity),
+                float(price),
+                float(amount),
+                row['currency'],
+                'Imported from Trade Republic',
+                row['date'],
+                row['id_transaction'],
+            ),
+        )
+        ops_created += 1
+
+    return ops_created, ops_skipped, holdings_created
+
+
+def parse_bank_import_settings_from_form(source):
+    form = request.form
+    from_date = (form.get('from_date') or '').strip() or None
+    if source == 'revolut':
+        currency_accounts = {}
+        enabled_currencies = []
+        for currency in form.getlist('currencies'):
+            currency = normalize_currency(currency)
+            if form.get(f'enabled_{currency}') == 'on':
+                enabled_currencies.append(currency)
+            account_id = form.get(f'account_{currency}', type=int)
+            if account_id:
+                currency_accounts[currency] = account_id
+        return {
+            'currency_accounts': currency_accounts,
+            'enabled_currencies': enabled_currencies,
+            'from_date': from_date,
+        }
+    return {
+        'account_id': form.get('account_id', type=int),
+        'investment_account_id': form.get('investment_account_id', type=int),
+        'create_investments': form.get('create_investments') == 'on',
+        'from_date': from_date,
+    }
+
+
+def validate_bank_import_settings(db, user_id, source, settings):
+    """Normalize settings (JSON round-trips may stringify ids) and verify account
+    ownership. Returns an error message or None."""
+    account_ids = set()
+    if source == 'revolut':
+        try:
+            settings['currency_accounts'] = {
+                normalize_currency(currency): int(account_id)
+                for currency, account_id in (settings.get('currency_accounts') or {}).items()
+                if account_id
+            }
+        except (TypeError, ValueError):
+            return 'Invalid account mapping.'
+        settings['enabled_currencies'] = [
+            normalize_currency(currency) for currency in (settings.get('enabled_currencies') or [])
+        ]
+        if not any(
+            currency in settings['currency_accounts']
+            for currency in settings['enabled_currencies']
+        ):
+            return 'Map at least one enabled currency to an account.'
+        account_ids.update(settings['currency_accounts'].values())
+    else:
+        try:
+            settings['account_id'] = int(settings.get('account_id') or 0) or None
+            settings['investment_account_id'] = int(settings.get('investment_account_id') or 0) or None
+        except (TypeError, ValueError):
+            return 'Invalid account selected.'
+        if not settings['account_id']:
+            return 'Select a target account for Trade Republic.'
+        account_ids.add(settings['account_id'])
+        settings['create_investments'] = bool(settings.get('create_investments'))
+        if settings['create_investments']:
+            if not settings['investment_account_id']:
+                return 'Select an investment account or disable investment creation.'
+            valid_investment_ids = {acc['id'] for acc in get_investment_accounts(db, user_id)}
+            if settings['investment_account_id'] not in valid_investment_ids:
+                return 'Invalid investment account selected.'
+
+    if account_ids:
+        placeholders = ','.join('?' for _ in account_ids)
+        owned = {
+            row['id'] for row in db.execute(
+                f'SELECT id FROM accounts WHERE user_id = ? AND id IN ({placeholders})',
+                (user_id, *account_ids),
+            ).fetchall()
+        }
+        if account_ids - owned:
+            return 'Invalid account selected.'
+
+    if settings.get('from_date'):
+        try:
+            settings['from_date'] = parse_import_date(settings['from_date'])
+        except ValueError:
+            return 'Invalid from date.'
+    else:
+        settings['from_date'] = None
+    return None
+
+
+def build_bank_import_context(db, user_id):
+    accounts = db.execute(
+        'SELECT * FROM accounts WHERE user_id = ? ORDER BY name', (user_id,)
+    ).fetchall()
+    investment_accounts = get_investment_accounts(db, user_id)
+    sources = {}
+    for source in BANK_IMPORT_SOURCES:
+        entry = {
+            'label': BANK_IMPORT_SOURCE_LABELS[source],
+            'files': list_bank_import_files(source),
+            'currencies': [],
+            'error': None,
+            'settings': get_user_setting(db, user_id, f'bank_import.{source}', {}) or {},
+        }
+        try:
+            data = load_bank_source_rows(source)
+            counts = defaultdict(int)
+            for row in data['rows']:
+                counts[row['currency']] += 1
+            entry['currencies'] = [
+                {'currency': currency, 'count': counts[currency]}
+                for currency in sorted(counts, key=lambda cur: -counts[cur])
+            ]
+        except ValueError as exc:
+            entry['error'] = str(exc)
+        sources[source] = entry
+    return accounts, investment_accounts, sources
+
+
+@app.route('/import/bank')
+@login_required
+def bank_import():
+    db = get_db()
+    accounts, investment_accounts, sources = build_bank_import_context(db, current_user.id)
+    return render_template(
+        'import_bank.html',
+        accounts=accounts,
+        investment_accounts=investment_accounts,
+        sources=sources,
+        preview=None,
+        preview_source=None,
+        preview_settings_json=None,
+    )
+
+
+@app.route('/import/bank/preview', methods=['POST'])
+@login_required
+def bank_import_preview():
+    db = get_db()
+    source = request.form.get('source', '')
+    if source not in BANK_IMPORT_SOURCES:
+        flash('Unknown bank import source.', 'danger')
+        return redirect(url_for('bank_import'))
+
+    upload = request.files.get('new_file')
+    if upload and upload.filename:
+        filename = secure_filename(upload.filename)
+        if not filename.lower().endswith('.csv'):
+            flash('Only CSV files can be added.', 'danger')
+            return redirect(url_for('bank_import'))
+        os.makedirs(BANK_IMPORT_SOURCES[source], exist_ok=True)
+        upload.save(os.path.join(BANK_IMPORT_SOURCES[source], filename))
+        flash(f'Added {filename} to the {BANK_IMPORT_SOURCE_LABELS[source]} folder.', 'info')
+
+    settings = parse_bank_import_settings_from_form(source)
+    error = validate_bank_import_settings(db, current_user.id, source, settings)
+    if error:
+        flash(error, 'danger')
+        return redirect(url_for('bank_import'))
+
+    try:
+        plan = build_bank_import_plan(db, current_user.id, source, settings)
+    except ValueError as exc:
+        flash(str(exc), 'danger')
+        return redirect(url_for('bank_import'))
+
+    accounts, investment_accounts, sources = build_bank_import_context(db, current_user.id)
+    # Show the submitted (not yet saved) settings for the previewed source.
+    sources[source]['settings'] = settings
+    return render_template(
+        'import_bank.html',
+        accounts=accounts,
+        investment_accounts=investment_accounts,
+        sources=sources,
+        preview=plan,
+        preview_source=source,
+        preview_settings_json=json.dumps(settings),
+    )
+
+
+@app.route('/import/bank/confirm', methods=['POST'])
+@login_required
+def bank_import_confirm():
+    db = get_db()
+    source = request.form.get('source', '')
+    if source not in BANK_IMPORT_SOURCES:
+        flash('Unknown bank import source.', 'danger')
+        return redirect(url_for('bank_import'))
+
+    try:
+        settings = json.loads(request.form.get('settings_json') or '{}')
+        if not isinstance(settings, dict):
+            raise ValueError
+    except ValueError:
+        flash('Invalid import settings.', 'danger')
+        return redirect(url_for('bank_import'))
+
+    error = validate_bank_import_settings(db, current_user.id, source, settings)
+    if error:
+        flash(error, 'danger')
+        return redirect(url_for('bank_import'))
+
+    try:
+        # Re-build from the files on disk: cookie sessions cannot carry the rows
+        # and re-parsing ~2k rows is effectively free.
+        plan = build_bank_import_plan(db, current_user.id, source, settings)
+    except ValueError as exc:
+        flash(str(exc), 'danger')
+        return redirect(url_for('bank_import'))
+
+    imported, updated, migrated, errors = upsert_bank_transactions(db, current_user.id, plan['rows'])
+
+    ops_created = ops_skipped = holdings_created = 0
+    if plan['investment_plan']:
+        ops_created, ops_skipped, holdings_created = import_tr_investment_ops(
+            db, current_user.id, plan['investment_plan']['account_id'], plan['investment_plan']['rows']
+        )
+
+    set_user_setting(db, current_user.id, f'bank_import.{source}', settings)
+    db.commit()
+
+    label = BANK_IMPORT_SOURCE_LABELS[source]
+    flash(
+        f'{label}: imported {imported} new, updated {updated} existing'
+        + (f', migrated {migrated} legacy' if migrated else '')
+        + ' transactions.',
+        'success',
+    )
+    if plan['investment_plan']:
+        flash(
+            f'Investments: created {ops_created} operations'
+            + (f' and {holdings_created} holdings' if holdings_created else '')
+            + (f', skipped {ops_skipped} already imported' if ops_skipped else '')
+            + '.',
+            'success' if ops_created or not ops_skipped else 'info',
+        )
+    if errors and len(errors) <= 5:
+        for error_message in errors:
+            flash(error_message, 'danger')
+    elif errors:
+        flash(f'There were {len(errors)} errors during import.', 'danger')
+
+    return redirect(url_for('transactions'))
+
+
 @app.route('/import', methods=['GET', 'POST'])
 @login_required
 def import_csv():
