@@ -1,4 +1,9 @@
+# Personal data
 finance.db
+**/revolut/*
+!**/revolut/.gitkeep
+**/trade_republic/*
+!**/trade_republic/.gitkeep
 .DS_Store
 .claude/
 
