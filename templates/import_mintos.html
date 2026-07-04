@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+
+{% block title %}Mintos Import - Personal Finance{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1><i class="bi bi-graph-up-arrow"></i> Mintos Import</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-10 col-lg-8">
+
+        {% if not investment_accounts %}
+        <div class="alert alert-warning">
+            <i class="bi bi-exclamation-triangle"></i>
+            You need a dashboard investment account first. Create one under
+            <a href="{{ url_for('investments') }}">Investments</a>.
+        </div>
+        {% else %}
+
+        <div class="card mb-4">
+            <div class="card-header"><i class="bi bi-bank"></i> Mintos statement</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Deposits become the cost basis of your <strong>Mintos Lending</strong> holding; the
+                    current total value (deposits + net interest) is booked as an evolution. Export the
+                    <strong>full</strong> account statement (Investors Account Statement) — partial exports
+                    would understate totals. Re-importing the same export is safe.
+                </p>
+
+                <div class="mb-3">
+                    <span class="form-label fw-bold">Detected files (all processed, newest is authoritative for value)</span>
+                    {% if files %}
+                    <ul class="small mb-0">{% for file in files %}<li><code>{{ file }}</code></li>{% endfor %}</ul>
+                    {% else %}
+                    <div class="form-text">No <code>.xlsx</code> files in <code>data/raw/mintos/</code>. Upload one below.</div>
+                    {% endif %}
+                </div>
+
+                <form method="POST" action="{{ url_for('mintos_import_preview') }}" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label class="form-label">Add another export (optional)</label>
+                        <input type="file" class="form-control" name="new_file" accept=".xlsx">
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Investment account *</label>
+                        <select class="form-select" name="account_id" required>
+                            <option value="">Select investment account...</option>
+                            {% for account in investment_accounts %}
+                            <option value="{{ account.id }}"
+                                    {% if settings.account_id|string == account.id|string %}selected{% endif %}>
+                                {{ account.name }} ({{ account.currency }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    {% if mintos_holdings %}
+                    <div class="mb-3">
+                        <label class="form-label">Mintos Lending holding (optional — auto-detected if blank)</label>
+                        <select class="form-select" name="holding_id">
+                            <option value="">Use / create the holding in the selected account</option>
+                            {% for h in mintos_holdings %}
+                            <option value="{{ h.id }}"
+                                    {% if settings.holding_id|string == h.id|string %}selected{% endif %}>
+                                {{ h.asset_name }} — {{ h.account_name }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% endif %}
+
+                    <div class="mb-3 form-check">
+                        <input class="form-check-input" type="checkbox" id="create_holding" name="create_holding"
+                               {% if settings.create_holding or settings.create_holding is not defined %}checked{% endif %}>
+                        <label class="form-check-label" for="create_holding">
+                            Create the Mintos Lending holding if none exists in the account
+                        </label>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" {% if not files %}disabled{% endif %}>
+                        <i class="bi bi-search"></i> Preview Import
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        {% if preview %}
+        <div class="card mb-4 border-primary">
+            <div class="card-header bg-primary text-white">
+                <i class="bi bi-clipboard-check"></i> Preview — Mintos
+            </div>
+            <div class="card-body">
+                {% if preview.partial_warning %}
+                <div class="alert alert-warning small">
+                    <i class="bi bi-exclamation-triangle"></i>
+                    One export looks date-windowed (its "Date from" is later than another's). Mintos import
+                    expects the full account statement; totals may be understated.
+                </div>
+                {% endif %}
+
+                <table class="table table-sm small">
+                    <tbody>
+                        <tr><th>Deposits (cost basis)</th>
+                            <td>{{ format_currency(preview.total_deposits, preview.currency) }}
+                                — <strong>{{ preview.new_deposit_count }}</strong> new
+                                ({{ format_currency(preview.new_deposit_total, preview.currency) }}),
+                                {{ preview.existing_deposit_count }} already imported</td></tr>
+                        <tr><th>Net earnings (interest + fees − tax)</th>
+                            <td>{{ format_currency(preview.net_earnings, preview.currency) }}</td></tr>
+                        <tr><th>Current total value</th>
+                            <td><strong>{{ format_currency(preview.current_total_value, preview.currency) }}</strong></td></tr>
+                        <tr><th>Return to book now</th>
+                            <td>{{ format_currency(preview.gain_to_book, preview.currency) }}</td></tr>
+                        <tr><th>Statement range</th>
+                            <td>{{ preview.date_from }} → {{ preview.statement_end_date }}</td></tr>
+                        <tr><th>Target holding</th>
+                            <td>{% if preview.holding %}{{ preview.holding.asset_name }} (existing){% else %}
+                                <em>will create a Mintos Lending holding</em>{% endif %}</td></tr>
+                    </tbody>
+                </table>
+
+                <ul class="small mb-3">
+                    {% for file in preview.files %}
+                    <li><code>{{ file.name }}</code>: {{ file.row_count }} rows, {{ file.deposits }} deposit(s)</li>
+                    {% endfor %}
+                    <li>Row buckets:
+                        {% for bucket, count in preview.bucket_counts.items() %}{{ bucket }}={{ count }}{% if not loop.last %}, {% endif %}{% endfor %}</li>
+                    {% for state, count in preview.skipped.items() %}
+                    <li class="text-danger">{{ count }} rows skipped ({{ state }})</li>
+                    {% endfor %}
+                </ul>
+
+                <form method="POST" action="{{ url_for('mintos_import_confirm') }}">
+                    <input type="hidden" name="settings_json" value="{{ preview_settings_json }}">
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('mintos_import') }}" class="btn btn-outline-secondary">
+                            <i class="bi bi-x-lg"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-success">
+                            <i class="bi bi-check2-circle"></i> Import to Mintos Lending
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

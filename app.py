@@ -45,12 +45,51 @@ INVESTMENT_ASSET_CLASSES = (
 INVESTMENT_INCOME_PROFILES = ('fixed', 'variable')
 INVESTMENT_MARKET_SYNCABLE_CLASSES = ('ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund')
 BANK_IMPORT_SOURCES = {
-    'revolut': os.path.join('data', 'raw', 'revolut'),
-    'trade_republic': os.path.join('data', 'raw', 'trade_republic'),
-}
-BANK_IMPORT_SOURCE_LABELS = {
-    'revolut': 'Revolut',
-    'trade_republic': 'Trade Republic',
+    'revolut': {
+        'label': 'Revolut',
+        'folder': os.path.join('data', 'raw', 'revolut'),
+        'extensions': ('.csv',),
+        'multi_currency': True,
+        'investments': False,
+        # The Iberia Cards bill is debited from Revolut EUR; without this the
+        # charges (imported from the statements) would be double-counted.
+        'default_transfer_patterns': ['Iberia Cards'],
+    },
+    'trade_republic': {
+        'label': 'Trade Republic',
+        'folder': os.path.join('data', 'raw', 'trade_republic'),
+        'extensions': ('.csv',),
+        'multi_currency': False,
+        'investments': True,
+    },
+    'b100': {
+        'label': 'B100',
+        'folder': os.path.join('data', 'raw', 'B100'),
+        'extensions': ('.csv',),
+        'multi_currency': False,
+        'investments': False,
+    },
+    'edenred_restaurant': {
+        'label': 'Edenred Restaurante',
+        'folder': os.path.join('data', 'raw', 'edenred'),
+        'extensions': ('.xlsx',),
+        'multi_currency': False,
+        'investments': False,
+    },
+    'edenred_mobility': {
+        'label': 'Edenred Movilidad',
+        'folder': os.path.join('data', 'raw', 'edenred'),
+        'extensions': ('.xlsx',),
+        'multi_currency': False,
+        'investments': False,
+    },
+    'iberia_cards': {
+        'label': 'Iberia Cards',
+        'folder': os.path.join('data', 'raw', 'iberia_cards'),
+        'extensions': ('.xlsx',),
+        'multi_currency': False,
+        'investments': False,
+    },
 }
 TRADE_REPUBLIC_INCOME_TYPES = {
     'TRANSFER_INBOUND',
@@ -63,6 +102,24 @@ TRADE_REPUBLIC_ASSET_CLASS_MAP = {
     'MUTUAL_FUND': 'IF',
     'PRIVATE_FUND': 'Private Equity Fund',
 }
+# Mintos statements (data/raw/mintos/*.xlsx) are imported into the single
+# 'Mintos Lending' holding: external deposits become cost basis, and the current
+# total value (deposits + net earnings) is booked via an evolution valuation.
+MINTOS_FOLDER = os.path.join('data', 'raw', 'mintos')
+MINTOS_EXTENSIONS = ('.xlsx',)
+MINTOS_DEPOSIT_TYPES = {'deposits', 'investors card deposits'}
+MINTOS_INTERNAL_TYPES = {
+    'investment',
+    'secondary market transactions (buy)',
+    'principal received',
+    'principal received from loan repurchase',
+}
+MINTOS_EARNING_TYPES = {
+    'interest received',
+    'interest received from loan repurchase',
+    'late fees received',
+}
+MINTOS_COST_TYPES = {'tax withholding', 'mintos core fee'}
 STOOQ_QUOTE_URL = 'https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv'
 YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
 YAHOO_CHART_URL_ALT = 'https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d'
@@ -2968,6 +3025,60 @@ def add_investment_snapshot():
     return redirect(url_for('investments'))
 
 
+def apply_mintos_evolution(db, user_id, holding, valuation_date, total_value, note='', id_transaction=None, base_value=None):
+    """Set a Mintos Lending holding's current total value at a date: record a
+    valuation and book the change vs the prior value as a 'dividend' return.
+    Shared by the manual evolution route and the statement importer; the importer
+    passes an explicit base_value (cost basis + already-booked returns) so repeated
+    imports converge instead of double-counting."""
+    if base_value is None:
+        base_value = get_holding_base_value(db, user_id, holding, valuation_date)
+    total_value = total_value.quantize(DECIMAL_MONEY_PLACES)
+    return_amount = (total_value - base_value).quantize(DECIMAL_MONEY_PLACES)
+    return_pct = None
+    if base_value > 0:
+        return_pct = ((return_amount / base_value) * Decimal('100')).quantize(DECIMAL_MONEY_PLACES)
+
+    db.execute(
+        '''INSERT INTO investment_valuations
+           (user_id, holding_id, valuation_date, total_value, currency, return_pct, return_amount, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        (
+            user_id,
+            holding['id'],
+            valuation_date,
+            float(total_value),
+            holding['currency'],
+            float(return_pct) if return_pct is not None else None,
+            float(return_amount),
+            note,
+        ),
+    )
+    db.execute(
+        '''UPDATE investment_holdings
+           SET quantity = 1, current_price = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND user_id = ?''',
+        (float(total_value), holding['id'], user_id),
+    )
+    if return_amount != 0:
+        db.execute(
+            '''INSERT INTO investment_operations
+               (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date, id_transaction)
+               VALUES (?, ?, ?, 'dividend', ?, ?, 0, ?, ?, ?)''',
+            (
+                user_id,
+                holding['account_id'],
+                holding['id'],
+                float(return_amount),
+                holding['currency'],
+                f'Auto return from valuation. {note}'.strip(),
+                valuation_date,
+                id_transaction,
+            ),
+        )
+    return {'total_value': total_value, 'return_amount': return_amount, 'return_pct': return_pct}
+
+
 @app.route('/investments/evolution/add', methods=['POST'])
 @login_required
 def add_investment_evolution():
@@ -3015,12 +3126,12 @@ def add_investment_evolution():
         if computed_total_value <= 0:
             flash('Mintos total value must be greater than zero.', 'danger')
             return redirect(url_for('investments'))
+        apply_mintos_evolution(db, current_user.id, holding, valuation_date, computed_total_value, note)
+        db.commit()
+        flash('Evolution recorded and returns auto-computed.', 'success')
+        return redirect(url_for('investments'))
 
-        computed_return_amount = (computed_total_value - base_value).quantize(DECIMAL_MONEY_PLACES)
-        if base_value > 0:
-            computed_return_pct = ((computed_return_amount / base_value) * Decimal('100')).quantize(DECIMAL_MONEY_PLACES)
-
-    elif holding_class == 'Fixed Income Fund':
+    if holding_class == 'Fixed Income Fund':
         if quantity <= 0:
             flash('Holding quantity must be greater than zero to apply fixed income yield.', 'danger')
             return redirect(url_for('investments'))
@@ -3040,12 +3151,10 @@ def add_investment_evolution():
         flash('Evolution automation is currently available for Mintos Lending and Fixed Income Fund holdings.', 'warning')
         return redirect(url_for('investments'))
 
-    if holding_class == 'Mintos Lending':
-        new_price = computed_total_value
-        quantity_to_store = Decimal('1').quantize(DECIMAL_QUANTITY_PLACES)
-    else:
-        new_price = (computed_total_value / quantity).quantize(DECIMAL_MONEY_PLACES)
-        quantity_to_store = quantity
+    # Mintos Lending is handled earlier via apply_mintos_evolution; only the
+    # per-share classes (Fixed Income Fund) reach this point.
+    new_price = (computed_total_value / quantity).quantize(DECIMAL_MONEY_PLACES)
+    quantity_to_store = quantity
 
     db.execute(
         '''INSERT INTO investment_valuations
@@ -3409,24 +3518,658 @@ def parse_trade_republic_csv(csv_text):
     return {'rows': rows, 'investment_rows': investment_rows, 'skipped': dict(skipped)}
 
 
+def synthetic_bank_id(prefix, *parts):
+    """Stable id for exports without a transaction id: hash of the row content
+    (including an occurrence index so identical rows stay distinct)."""
+    base = '|'.join(str(part or '').strip() for part in parts)
+    digest = hashlib.sha256(base.encode('utf-8')).hexdigest()[:16]
+    return f'{prefix}_{digest}'
+
+
+B100_INTERNAL_SAVE_RE = re.compile(r'off to save|move to save', re.IGNORECASE)
+
+
+def parse_b100_csv(csv_text):
+    """Parse a B100 export. Columns: Fecha de Operación, Fecha valor, Detalle,
+    Concepto, Cantidad, Saldo tras operación, Divisa, Tipo de Movimiento."""
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+
+    for row in reader:
+        try:
+            date = parse_import_date((row.get('Fecha de Operación') or '').strip())
+        except ValueError:
+            skipped['NO_DATE'] += 1
+            continue
+        try:
+            amount = Decimal((row.get('Cantidad') or '').strip() or '0').quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        detalle = (row.get('Detalle') or '').strip()
+        concepto = (row.get('Concepto') or '').strip()
+        saldo = (row.get('Saldo tras operación') or '').strip()
+
+        # B100's automatic-savings moves are internal: keep them out of
+        # income/expense reports (same decision as Revolut vault transfers).
+        if B100_INTERNAL_SAVE_RE.search(f'{detalle} {concepto}'):
+            transaction_type = 'transfer'
+        else:
+            transaction_type = 'income' if amount >= 0 else 'expense'
+
+        key = (date, str(amount), detalle, concepto, saldo)
+        occurrences[key] += 1
+
+        rows.append({
+            'id_transaction': synthetic_bank_id('b100', *key, occurrences[key]),
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': normalize_currency(row.get('Divisa')),
+            # Detalle text ('Transferencia enviada', ...) must NOT go into
+            # category_text: is_transfer_like_category would force everything
+            # to transfer and zero the account balance.
+            'category_text': '',
+            'description': ' | '.join(part for part in (detalle, concepto) if part),
+            'payee': concepto,
+        })
+
+    return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def load_xlsx_worksheet(path):
+    try:
+        openpyxl = importlib.import_module('openpyxl')
+    except ImportError as exc:
+        raise ValueError('openpyxl is required for XLSX bank imports') from exc
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        # Not read_only: some statements report broken sheet dimensions there.
+        workbook = openpyxl.load_workbook(path, data_only=True)
+    return workbook[workbook.sheetnames[0]]
+
+
+def _edenred_format_a_min_date(folder, product_token):
+    """Earliest date covered by any Format-A ('Movimientos') file for this product.
+    Format-B rows from on/after this date are skipped (Format A covers them with
+    merchant text); older Format-B rows backfill history A doesn't reach."""
+    min_date = None
+    if not os.path.isdir(folder):
+        return None
+    for name in sorted(os.listdir(folder)):
+        if not name.lower().endswith('.xlsx'):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            worksheet = load_xlsx_worksheet(path)
+        except Exception:
+            continue
+        rows = list(worksheet.iter_rows(values_only=True))
+        if _edenred_format_b_product(rows, path) is not None:
+            continue  # Format-B file, not Format A
+        product = ''
+        for raw_row in rows:
+            cells = list(raw_row) + [None] * 3
+            first = str(cells[0] or '').strip()
+            if first.lower().startswith('producto'):
+                product = str(cells[1] or '').strip().lower()
+            elif first == 'Fecha':
+                break
+        if product_token not in product:
+            continue
+        for date in _edenred_format_a_dates(rows):
+            if min_date is None or date < min_date:
+                min_date = date
+    return min_date
+
+
+def _edenred_format_a_dates(rows):
+    in_table = False
+    for raw_row in rows:
+        cells = list(raw_row) + [None] * 3
+        if not in_table:
+            if str(cells[0] or '').strip() == 'Fecha':
+                in_table = True
+            continue
+        raw_date = cells[0]
+        if raw_date is None:
+            continue
+        timestamp = raw_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(raw_date, datetime) else str(raw_date).strip()
+        date = parse_bank_export_date(timestamp)
+        if date:
+            yield date
+
+
+def _edenred_format_b_product(rows, path):
+    """Return 'restaurant'/'movilidad' if these rows look like a Format-B
+    ('Sheet1') export, else None. Format B has no in-sheet 'Producto:' marker, so
+    product is decided by header shape and confirmed by filename."""
+    if not rows:
+        return None
+    header = [str(c or '') for c in (list(rows[0]) + [None] * 5)[:5]]
+    # Restaurant B: 'Num. Tarjeta | Usuario | Tipo de Operación | Fecha Operación | Monto'
+    if 'Num. Tarjeta' in header[0] and any('Monto' in cell for cell in header):
+        return 'restaurant'
+    # Mobility B: 'Tipo de Operación | Monto | Fecha Ejecución' (mojibake-tolerant)
+    if 'Tipo de Operaci' in header[0] and any('Monto' in cell for cell in header):
+        return 'movilidad'
+    return None
+
+
+def parse_edenred_xlsx(path, product_token):
+    """Parse an Edenred movements export. Two layouts exist: Format A
+    ('Movimientos' sheet, 'Producto:' header, rich merchant text) and Format B
+    ('Sheet1', signed amounts, no merchant text but longer history)."""
+    worksheet = load_xlsx_worksheet(path)
+    rows = list(worksheet.iter_rows(values_only=True))
+    if _edenred_format_b_product(rows, path) is not None:
+        return _parse_edenred_format_b(path, rows, product_token)
+    return _parse_edenred_format_a(rows, product_token)
+
+
+def _parse_edenred_format_a(rows, product_token):
+    """Format A: 'Producto:' header row identifies the product; rows from other
+    products are ignored so each Edenred source only picks up its own files."""
+    out = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+
+    product = ''
+    in_table = False
+    for raw_row in rows:
+        cells = list(raw_row) + [None] * 3
+        first = str(cells[0] or '').strip()
+        if not in_table:
+            if first.lower().startswith('producto'):
+                product = str(cells[1] or '').strip().lower()
+            elif first == 'Fecha':
+                if product_token not in product:
+                    return {'rows': [], 'investment_rows': [], 'skipped': {}}
+                in_table = True
+            continue
+
+        raw_date, detail, importe = cells[0], cells[1], cells[2]
+        if raw_date is None:
+            continue
+        timestamp = raw_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(raw_date, datetime) else str(raw_date).strip()
+        date = parse_bank_export_date(timestamp)
+        if not date:
+            skipped['NO_DATE'] += 1
+            continue
+        try:
+            amount = Decimal(str(importe if importe is not None else '0')).quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        detail = str(detail or '').strip()
+        # Edenred amounts are unsigned: RECARGA rows are top-ups, the rest is spending.
+        is_topup = detail.strip().upper() == 'RECARGA'
+        transaction_type = 'income' if is_topup else 'expense'
+        if not is_topup:
+            amount = -amount
+
+        key = (product_token, timestamp, detail, str(abs(amount)))
+        occurrences[key] += 1
+
+        out.append({
+            'id_transaction': synthetic_bank_id('edr', *key, occurrences[key]),
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': 'EUR',
+            'category_text': '',
+            'description': detail,
+            'payee': '' if is_topup else detail.split(' - ')[0].strip(),
+        })
+
+    return {'rows': out, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def _parse_edenred_format_b(path, rows, product_token):
+    """Format B ('Sheet1'): signed amounts, no merchant text. Used to backfill the
+    older history Format A doesn't reach; rows already covered by a Format-A file
+    (date >= that file's earliest date) are skipped so the richer A row wins."""
+    file_product = _edenred_format_b_product(rows, path)
+    if file_product != product_token:
+        return {'rows': [], 'investment_rows': [], 'skipped': {}}
+
+    # Mobility B: type(0) | monto(1) | fecha(2).  Restaurant B has the amount and
+    # date shifted right (num/usuario prefix columns).
+    if file_product == 'restaurant':
+        type_idx, date_idx, amount_idx = 2, 3, 4
+    else:
+        type_idx, date_idx, amount_idx = 0, 2, 1
+
+    cutoff = _edenred_format_a_min_date(os.path.dirname(path), product_token)
+
+    out = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+    for raw_row in rows[1:]:
+        cells = list(raw_row) + [None] * 5
+        raw_date, monto = cells[date_idx], cells[amount_idx]
+        if raw_date is None or monto is None:
+            continue
+        timestamp = raw_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(raw_date, datetime) else str(raw_date).strip()
+        date = parse_bank_export_date(timestamp)
+        if not date:
+            skipped['NO_DATE'] += 1
+            continue
+        if cutoff and date >= cutoff:
+            skipped['COVERED_BY_FORMAT_A'] += 1
+            continue
+        try:
+            amount = Decimal(str(monto)).quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        op_type = str(cells[type_idx] or '').strip()
+        transaction_type = 'income' if amount >= 0 else 'expense'
+
+        key = (product_token, date, str(abs(amount)))
+        occurrences[key] += 1
+
+        out.append({
+            'id_transaction': synthetic_bank_id('edr', *key, occurrences[key]),
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': 'EUR',
+            'category_text': '',
+            'description': op_type,
+            'payee': '',
+        })
+
+    return {'rows': out, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def parse_iberia_cards_xlsx(path):
+    """Parse an Iberia Cards monthly statement: transaction tables follow a
+    'N° / FECHA OPERACIÓN / COMERCIO / IMPORTE DIVISA / IMPORTE EUROS' header
+    (one table per card)."""
+    worksheet = load_xlsx_worksheet(path)
+    rows = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+
+    in_table = False
+    for raw_row in worksheet.iter_rows(values_only=True):
+        cells = list(raw_row) + [None] * 9
+        fecha, comercio, importe_eur = cells[2], cells[3], cells[5]
+
+        if isinstance(fecha, str) and 'FECHA OPERACI' in fecha.upper():
+            in_table = True
+            continue
+        if not in_table:
+            continue
+
+        if isinstance(fecha, datetime):
+            date = fecha.strftime('%Y-%m-%d')
+        else:
+            try:
+                date = parse_import_date(str(fecha or '').strip())
+            except ValueError:
+                # Dateless row with COMERCIO text = summary block ('Deuda
+                # pendiente...', 'TOTAL A CARGAR') ends the table; blank spacer
+                # rows are tolerated.
+                if str(comercio or '').strip():
+                    in_table = False
+                continue
+
+        if not isinstance(importe_eur, (int, float)):
+            skipped['BAD_AMOUNT'] += 1
+            continue
+        comercio = str(comercio or '').strip()
+        # Statement amounts are charges: positive = expense, negative = refund.
+        amount = (-Decimal(str(importe_eur))).quantize(Decimal('0.01'))
+        transaction_type = 'income' if amount >= 0 else 'expense'
+
+        key = (date, comercio, str(abs(amount)))
+        occurrences[key] += 1
+
+        rows.append({
+            'id_transaction': synthetic_bank_id('ibc', *key, occurrences[key]),
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': transaction_type,
+            'currency': 'EUR',
+            'category_text': '',
+            'description': comercio,
+            'payee': comercio,
+        })
+
+    return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def parse_mintos_xlsx(path):
+    """Aggregate a Mintos 'Investors Account Statement' export. Deposits are
+    classified for cost basis; earnings/costs net into the gain; internal moves
+    (cash<->loans) only shift allocation. Assumes a full-history export."""
+    worksheet = load_xlsx_worksheet(path)
+    rows = list(worksheet.iter_rows(values_only=True))
+    skipped = defaultdict(int)
+    result = {
+        'currency': 'EUR',
+        'statement_end_date': '',
+        'date_from': '',
+        'deposits': [],
+        'total_deposits': Decimal('0'),
+        'net_earnings': Decimal('0'),
+        'cash_balance': Decimal('0'),
+        'outstanding_principal': Decimal('0'),
+        'current_total_value': Decimal('0'),
+        'bucket_counts': {'external_deposit': 0, 'internal': 0, 'earning': 0, 'cost': 0},
+        'skipped': {},
+    }
+    if not rows:
+        return result
+
+    header = [str(c or '').strip() for c in rows[0]]
+
+    def col(name):
+        return header.index(name) if name in header else None
+
+    idx_date = col('Date')
+    idx_type = col('Transaction Type')
+    idx_amount = col('Amount')
+    idx_currency = col('Currency')
+    idx_from = col('Date from')
+    if idx_date is None or idx_type is None or idx_amount is None:
+        skipped['BAD_HEADER'] += 1
+        result['skipped'] = dict(skipped)
+        return result
+
+    occurrences = defaultdict(int)
+    currencies = set()
+    max_date = ''
+    internal_sum = Decimal('0')
+    for raw_row in rows[1:]:
+        cells = list(raw_row) + [None] * (len(header) + 1)
+        raw_date, raw_type, raw_amount = cells[idx_date], cells[idx_type], cells[idx_amount]
+        if raw_type is None and raw_amount is None:
+            continue
+        timestamp = raw_date.strftime('%Y-%m-%d %H:%M:%S') if isinstance(raw_date, datetime) else str(raw_date or '').strip()
+        date = parse_bank_export_date(timestamp)
+        if not date:
+            skipped['NO_DATE'] += 1
+            continue
+        try:
+            amount = Decimal(str(raw_amount if raw_amount is not None else '0')).quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        op_type = str(raw_type or '').strip()
+        op_key = op_type.lower()
+        if idx_currency is not None and cells[idx_currency]:
+            currencies.add(str(cells[idx_currency]).strip().upper())
+        if date > max_date:
+            max_date = date
+
+        if op_key in MINTOS_DEPOSIT_TYPES:
+            result['bucket_counts']['external_deposit'] += 1
+            occ_key = (date, op_key, str(amount))
+            occurrences[occ_key] += 1
+            result['deposits'].append({
+                'id_transaction': synthetic_bank_id('mintos', date, op_key, str(amount), occurrences[occ_key]),
+                'date': date,
+                'amount': amount,
+                'type': op_type,
+            })
+            result['total_deposits'] += amount
+        elif op_key in MINTOS_INTERNAL_TYPES:
+            result['bucket_counts']['internal'] += 1
+            internal_sum += amount
+        elif op_key in MINTOS_EARNING_TYPES:
+            result['bucket_counts']['earning'] += 1
+            result['net_earnings'] += amount
+        elif op_key in MINTOS_COST_TYPES:
+            result['bucket_counts']['cost'] += 1
+            result['net_earnings'] += amount  # costs are already negative
+        else:
+            skipped[f'UNKNOWN_TYPE:{op_type}'] += 1
+            continue
+
+        result['cash_balance'] += amount
+
+    result['statement_end_date'] = max_date
+    if idx_from is not None and len(rows) > 1:
+        first_from = rows[1][idx_from]
+        result['date_from'] = first_from.strftime('%Y-%m-%d') if isinstance(first_from, datetime) else str(first_from or '')[:10]
+    result['outstanding_principal'] = (-internal_sum).quantize(Decimal('0.01'))
+    result['current_total_value'] = (result['total_deposits'] + result['net_earnings']).quantize(Decimal('0.01'))
+    if len(currencies) == 1:
+        result['currency'] = currencies.pop()
+    elif len(currencies) > 1:
+        skipped['MIXED_CURRENCY'] += 1
+    result['skipped'] = dict(skipped)
+    return result
+
+
+def find_or_create_mintos_holding(db, user_id, account_id, create_if_missing, currency='EUR'):
+    """Return the Mintos Lending holding in an investment account (creating it
+    when asked). When several exist the caller must pass an explicit holding_id."""
+    holding = db.execute(
+        '''SELECT * FROM investment_holdings
+           WHERE user_id = ? AND account_id = ? AND asset_class = 'Mintos Lending'
+           ORDER BY id''',
+        (user_id, account_id),
+    ).fetchone()
+    if holding or not create_if_missing:
+        return holding
+    cursor = db.execute(
+        '''INSERT INTO investment_holdings
+           (user_id, account_id, asset_name, ticker, isin, asset_class, currency,
+            quantity, avg_cost, current_price, updated_at)
+           VALUES (?, ?, 'Mintos', '', '', 'Mintos Lending', ?, 1, 0, 0, CURRENT_TIMESTAMP)''',
+        (user_id, account_id, currency),
+    )
+    return db.execute(
+        'SELECT * FROM investment_holdings WHERE id = ?', (cursor.lastrowid,)
+    ).fetchone()
+
+
+def list_mintos_files():
+    if not os.path.isdir(MINTOS_FOLDER):
+        return []
+    return sorted(
+        name for name in os.listdir(MINTOS_FOLDER)
+        if name.lower().endswith(MINTOS_EXTENSIONS) and os.path.isfile(os.path.join(MINTOS_FOLDER, name))
+    )
+
+
+def build_mintos_import_plan(db, user_id, account_id, holding_id, create_holding):
+    """Parse and merge every Mintos export, resolve the target holding, and work
+    out the deposits to add and the total value to book. Shared by preview and
+    confirm. Assumes each file is a full-history export (Date from ~ inception)."""
+    files = list_mintos_files()
+    merged_deposits = {}
+    skipped = defaultdict(int)
+    file_summaries = []
+    latest = None
+    earliest_from = None
+
+    for name in files:
+        path = os.path.join(MINTOS_FOLDER, name)
+        try:
+            parsed = parse_mintos_xlsx(path)
+        except Exception as exc:
+            raise ValueError(f'Could not read {name}: {exc}')
+        for dep in parsed['deposits']:
+            merged_deposits[dep['id_transaction']] = dep
+        for state, count in parsed['skipped'].items():
+            skipped[state] += count
+        file_summaries.append({
+            'name': name,
+            'row_count': sum(parsed['bucket_counts'].values()),
+            'deposits': len(parsed['deposits']),
+        })
+        latest = parsed  # files are sorted ascending: the last one is authoritative
+        if parsed['date_from'] and (earliest_from is None or parsed['date_from'] < earliest_from):
+            earliest_from = parsed['date_from']
+
+    # Resolve the existing holding (without creating) for preview math.
+    holding = None
+    if holding_id:
+        holding = db.execute(
+            '''SELECT * FROM investment_holdings
+               WHERE id = ? AND user_id = ? AND account_id = ? AND asset_class = 'Mintos Lending' ''',
+            (holding_id, user_id, account_id),
+        ).fetchone()
+    elif account_id:
+        holding = find_or_create_mintos_holding(db, user_id, account_id, create_if_missing=False)
+
+    existing_op_ids = {
+        row['id_transaction'] for row in db.execute(
+            'SELECT id_transaction FROM investment_operations WHERE user_id = ? AND id_transaction IS NOT NULL',
+            (user_id,),
+        ).fetchall()
+    }
+    deposits = sorted(merged_deposits.values(), key=lambda d: (d['date'], d['id_transaction']))
+    new_deposits = [d for d in deposits if d['id_transaction'] not in existing_op_ids]
+    new_deposit_total = sum((d['amount'] for d in new_deposits), Decimal('0')).quantize(DECIMAL_MONEY_PLACES)
+
+    current_total_value = latest['current_total_value'] if latest else Decimal('0')
+    statement_end_date = latest['statement_end_date'] if latest else ''
+    net_earnings = latest['net_earnings'] if latest else Decimal('0')
+
+    base_value = get_holding_base_value(db, user_id, holding, statement_end_date) if holding else Decimal('0')
+    projected_base = (base_value + new_deposit_total).quantize(DECIMAL_MONEY_PLACES)
+    gain_to_book = (current_total_value - projected_base).quantize(DECIMAL_MONEY_PLACES) if current_total_value else Decimal('0')
+
+    # A windowed (non-full-history) export would understate deposits/earnings.
+    partial_warning = bool(latest and earliest_from and latest['date_from'] and latest['date_from'] > earliest_from)
+
+    return {
+        'files': file_summaries,
+        'currency': latest['currency'] if latest else DEFAULT_BASE_CURRENCY,
+        'statement_end_date': statement_end_date,
+        'date_from': latest['date_from'] if latest else '',
+        'deposits': deposits,
+        'total_deposits': latest['total_deposits'] if latest else Decimal('0'),
+        'new_deposit_count': len(new_deposits),
+        'new_deposit_total': new_deposit_total,
+        'existing_deposit_count': len(deposits) - len(new_deposits),
+        'net_earnings': net_earnings,
+        'current_total_value': current_total_value,
+        'gain_to_book': gain_to_book,
+        'bucket_counts': latest['bucket_counts'] if latest else {},
+        'skipped': dict(skipped),
+        'holding': holding,
+        'partial_warning': partial_warning,
+    }
+
+
+def import_mintos_statement(db, user_id, holding, plan):
+    """Apply new deposits to the cost basis, then set the current total value via
+    an evolution valuation. Idempotent: deposits are keyed by id_transaction and
+    the booked gain self-corrects against already-booked returns."""
+    existing_ids = {
+        row['id_transaction'] for row in db.execute(
+            'SELECT id_transaction FROM investment_operations WHERE user_id = ? AND id_transaction IS NOT NULL',
+            (user_id,),
+        ).fetchall()
+    }
+    invested = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    value = Decimal(str(holding['current_price'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    deposits_created = 0
+    for dep in plan['deposits']:
+        if dep['id_transaction'] in existing_ids:
+            continue
+        invested = (invested + dep['amount']).quantize(DECIMAL_MONEY_PLACES)
+        value = (value + dep['amount']).quantize(DECIMAL_MONEY_PLACES)
+        db.execute(
+            '''UPDATE investment_holdings
+               SET quantity = 1, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?''',
+            (float(invested), float(value), holding['id'], user_id),
+        )
+        db.execute(
+            '''INSERT INTO investment_operations
+               (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date, id_transaction)
+               VALUES (?, ?, ?, 'deposit', ?, ?, 0, ?, ?, ?)''',
+            (
+                user_id,
+                holding['account_id'],
+                holding['id'],
+                float(dep['amount']),
+                holding['currency'],
+                'Imported from Mintos statement',
+                dep['date'],
+                dep['id_transaction'],
+            ),
+        )
+        deposits_created += 1
+
+    holding = db.execute('SELECT * FROM investment_holdings WHERE id = ?', (holding['id'],)).fetchone()
+
+    valuation_action = 'none'
+    target_value = plan['current_total_value']
+    valuation_date = plan['statement_end_date']
+    if target_value and valuation_date:
+        booked = db.execute(
+            '''SELECT COALESCE(SUM(amount), 0) AS total FROM investment_operations
+               WHERE user_id = ? AND holding_id = ? AND operation_type = 'dividend' ''',
+            (user_id, holding['id']),
+        ).fetchone()['total']
+        already_booked = Decimal(str(booked or 0)).quantize(DECIMAL_MONEY_PLACES)
+        # base = cost basis + returns already booked => gain self-corrects on re-import.
+        base_value = (Decimal(str(holding['avg_cost'] or 0)) + already_booked).quantize(DECIMAL_MONEY_PLACES)
+
+        existing_val = db.execute(
+            'SELECT id, total_value FROM investment_valuations WHERE user_id = ? AND holding_id = ? AND valuation_date = ?',
+            (user_id, holding['id'], valuation_date),
+        ).fetchone()
+        if existing_val is not None and Decimal(str(existing_val['total_value'])).quantize(DECIMAL_MONEY_PLACES) == target_value.quantize(DECIMAL_MONEY_PLACES):
+            valuation_action = 'unchanged'
+        else:
+            if existing_val is not None:
+                db.execute('DELETE FROM investment_valuations WHERE id = ?', (existing_val['id'],))
+                valuation_action = 'updated'
+            else:
+                valuation_action = 'created'
+            apply_mintos_evolution(
+                db, user_id, holding, valuation_date, target_value,
+                note='Imported from Mintos statement', base_value=base_value,
+            )
+
+    return {'deposits_created': deposits_created, 'valuation_action': valuation_action}
+
+
 BANK_IMPORT_PARSERS = {
     'revolut': parse_revolut_csv,
     'trade_republic': parse_trade_republic_csv,
+    'b100': parse_b100_csv,
+    'edenred_restaurant': lambda path: parse_edenred_xlsx(path, 'restaurant'),
+    'edenred_mobility': lambda path: parse_edenred_xlsx(path, 'movilidad'),
+    'iberia_cards': parse_iberia_cards_xlsx,
 }
 
 
 def list_bank_import_files(source):
-    folder = BANK_IMPORT_SOURCES[source]
+    config = BANK_IMPORT_SOURCES[source]
+    folder = config['folder']
     if not os.path.isdir(folder):
         return []
     return sorted(
         name for name in os.listdir(folder)
-        if name.lower().endswith('.csv') and os.path.isfile(os.path.join(folder, name))
+        if name.lower().endswith(config['extensions']) and os.path.isfile(os.path.join(folder, name))
     )
 
 
 def load_bank_source_rows(source):
-    """Parse and merge every CSV found for a source; newest file wins per id."""
+    """Parse and merge every file found for a source; newest file wins per id."""
+    config = BANK_IMPORT_SOURCES[source]
     parser = BANK_IMPORT_PARSERS[source]
 
     merged_rows = {}
@@ -3438,11 +4181,14 @@ def load_bank_source_rows(source):
     # Sorted ascending: filenames carry the export date, so later files override
     # overlapping ids from earlier exports.
     for name in list_bank_import_files(source):
-        path = os.path.join(BANK_IMPORT_SOURCES[source], name)
+        path = os.path.join(config['folder'], name)
         try:
-            with open(path, encoding='utf-8-sig', newline='') as handle:
-                parsed = parser(handle.read())
-        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            if name.lower().endswith('.xlsx'):
+                parsed = parser(path)
+            else:
+                with open(path, encoding='utf-8-sig', newline='') as handle:
+                    parsed = parser(handle.read())
+        except Exception as exc:
             raise ValueError(f'Could not read {name}: {exc}')
 
         for state, count in parsed['skipped'].items():
@@ -3468,6 +4214,7 @@ def load_bank_source_rows(source):
 def build_bank_import_plan(db, user_id, source, settings):
     """Load all source files, apply settings, and return everything the preview
     shows and the confirm step executes (single shared code path)."""
+    config = BANK_IMPORT_SOURCES[source]
     data = load_bank_source_rows(source)
     accounts = {
         account['id']: account
@@ -3477,13 +4224,25 @@ def build_bank_import_plan(db, user_id, source, settings):
     from_date = (settings.get('from_date') or '').strip()
     currency_accounts = settings.get('currency_accounts') or {}
     enabled_currencies = set(settings.get('enabled_currencies') or [])
+    transfer_patterns = [
+        pattern.lower() for pattern in (settings.get('transfer_patterns') or []) if pattern
+    ]
 
     prepared = []
     currency_stats = {}
     skipped_unmapped = 0
     skipped_before_date = 0
+    pattern_transfers = 0
 
     for row in data['rows']:
+        # User-configured patterns (e.g. the Iberia Cards bill debit) force
+        # transfer type so the same money isn't counted as expense twice.
+        pattern_forced = False
+        if row['transaction_type'] != 'transfer' and transfer_patterns:
+            row_text = f"{row['description']} {row['payee']}".lower()
+            if any(pattern in row_text for pattern in transfer_patterns):
+                row = {**row, 'transaction_type': 'transfer'}
+                pattern_forced = True
         currency = row['currency']
         stats = currency_stats.setdefault(currency, {
             'currency': currency,
@@ -3499,7 +4258,7 @@ def build_bank_import_plan(db, user_id, source, settings):
         })
         stats['count'] += 1
 
-        if source == 'revolut':
+        if config['multi_currency']:
             account_id = currency_accounts.get(currency)
             enabled = currency in enabled_currencies
         else:
@@ -3527,6 +4286,8 @@ def build_bank_import_plan(db, user_id, source, settings):
             stats['expense'] += row['amount']
         else:
             stats['transfers'] += 1
+            if pattern_forced:
+                pattern_transfers += 1
 
         prepared.append({**row, 'account_id': account['id']})
 
@@ -3557,7 +4318,7 @@ def build_bank_import_plan(db, user_id, source, settings):
                 seen_legacy.add(legacy_id)
 
     investment_plan = None
-    if source == 'trade_republic' and settings.get('create_investments') and settings.get('investment_account_id'):
+    if config['investments'] and settings.get('create_investments') and settings.get('investment_account_id'):
         investment_account_id = settings['investment_account_id']
         investment_rows = [
             row for row in data['investment_rows']
@@ -3593,7 +4354,7 @@ def build_bank_import_plan(db, user_id, source, settings):
     samples = list(reversed(prepared[-10:]))
     return {
         'source': source,
-        'label': BANK_IMPORT_SOURCE_LABELS[source],
+        'label': config['label'],
         'files': data['files'],
         'cross_file_duplicates': data['cross_file_duplicates'],
         'skipped_states': data['skipped'],
@@ -3601,6 +4362,7 @@ def build_bank_import_plan(db, user_id, source, settings):
         'rows': prepared,
         'skipped_unmapped': skipped_unmapped,
         'skipped_before_date': skipped_before_date,
+        'pattern_transfers': pattern_transfers,
         'legacy_matches': legacy_matches,
         'investment_plan': investment_plan,
         'samples': samples,
@@ -3802,8 +4564,12 @@ def import_tr_investment_ops(db, user_id, investment_account_id, investment_rows
 
 def parse_bank_import_settings_from_form(source):
     form = request.form
+    config = BANK_IMPORT_SOURCES[source]
     from_date = (form.get('from_date') or '').strip() or None
-    if source == 'revolut':
+    transfer_patterns = [
+        line.strip() for line in (form.get('transfer_patterns') or '').splitlines() if line.strip()
+    ]
+    if config['multi_currency']:
         currency_accounts = {}
         enabled_currencies = []
         for currency in form.getlist('currencies'):
@@ -3817,20 +4583,25 @@ def parse_bank_import_settings_from_form(source):
             'currency_accounts': currency_accounts,
             'enabled_currencies': enabled_currencies,
             'from_date': from_date,
+            'transfer_patterns': transfer_patterns,
         }
-    return {
+    settings = {
         'account_id': form.get('account_id', type=int),
-        'investment_account_id': form.get('investment_account_id', type=int),
-        'create_investments': form.get('create_investments') == 'on',
         'from_date': from_date,
+        'transfer_patterns': transfer_patterns,
     }
+    if config['investments']:
+        settings['investment_account_id'] = form.get('investment_account_id', type=int)
+        settings['create_investments'] = form.get('create_investments') == 'on'
+    return settings
 
 
 def validate_bank_import_settings(db, user_id, source, settings):
     """Normalize settings (JSON round-trips may stringify ids) and verify account
     ownership. Returns an error message or None."""
+    config = BANK_IMPORT_SOURCES[source]
     account_ids = set()
-    if source == 'revolut':
+    if config['multi_currency']:
         try:
             settings['currency_accounts'] = {
                 normalize_currency(currency): int(account_id)
@@ -3851,19 +4622,25 @@ def validate_bank_import_settings(db, user_id, source, settings):
     else:
         try:
             settings['account_id'] = int(settings.get('account_id') or 0) or None
-            settings['investment_account_id'] = int(settings.get('investment_account_id') or 0) or None
         except (TypeError, ValueError):
             return 'Invalid account selected.'
         if not settings['account_id']:
-            return 'Select a target account for Trade Republic.'
+            return f"Select a target account for {config['label']}."
         account_ids.add(settings['account_id'])
-        settings['create_investments'] = bool(settings.get('create_investments'))
-        if settings['create_investments']:
-            if not settings['investment_account_id']:
-                return 'Select an investment account or disable investment creation.'
-            valid_investment_ids = {acc['id'] for acc in get_investment_accounts(db, user_id)}
-            if settings['investment_account_id'] not in valid_investment_ids:
+        if config['investments']:
+            try:
+                settings['investment_account_id'] = int(settings.get('investment_account_id') or 0) or None
+            except (TypeError, ValueError):
                 return 'Invalid investment account selected.'
+            settings['create_investments'] = bool(settings.get('create_investments'))
+            if settings['create_investments']:
+                if not settings['investment_account_id']:
+                    return 'Select an investment account or disable investment creation.'
+                valid_investment_ids = {acc['id'] for acc in get_investment_accounts(db, user_id)}
+                if settings['investment_account_id'] not in valid_investment_ids:
+                    return 'Invalid investment account selected.'
+        else:
+            settings['create_investments'] = False
 
     if account_ids:
         placeholders = ','.join('?' for _ in account_ids)
@@ -3883,6 +4660,11 @@ def validate_bank_import_settings(db, user_id, source, settings):
             return 'Invalid from date.'
     else:
         settings['from_date'] = None
+
+    settings['transfer_patterns'] = [
+        str(pattern).strip() for pattern in (settings.get('transfer_patterns') or [])
+        if str(pattern).strip()
+    ]
     return None
 
 
@@ -3892,13 +4674,20 @@ def build_bank_import_context(db, user_id):
     ).fetchall()
     investment_accounts = get_investment_accounts(db, user_id)
     sources = {}
-    for source in BANK_IMPORT_SOURCES:
+    for source, config in BANK_IMPORT_SOURCES.items():
+        settings = get_user_setting(db, user_id, f'bank_import.{source}', {}) or {}
+        if 'transfer_patterns' not in settings:
+            settings['transfer_patterns'] = list(config.get('default_transfer_patterns', []))
         entry = {
-            'label': BANK_IMPORT_SOURCE_LABELS[source],
+            'label': config['label'],
+            'folder': config['folder'].replace(os.sep, '/'),
+            'extensions': config['extensions'],
+            'multi_currency': config['multi_currency'],
+            'investments': config['investments'],
             'files': list_bank_import_files(source),
             'currencies': [],
             'error': None,
-            'settings': get_user_setting(db, user_id, f'bank_import.{source}', {}) or {},
+            'settings': settings,
         }
         try:
             data = load_bank_source_rows(source)
@@ -3940,15 +4729,16 @@ def bank_import_preview():
         flash('Unknown bank import source.', 'danger')
         return redirect(url_for('bank_import'))
 
+    config = BANK_IMPORT_SOURCES[source]
     upload = request.files.get('new_file')
     if upload and upload.filename:
         filename = secure_filename(upload.filename)
-        if not filename.lower().endswith('.csv'):
-            flash('Only CSV files can be added.', 'danger')
+        if not filename.lower().endswith(config['extensions']):
+            flash(f"Only {' / '.join(config['extensions'])} files can be added here.", 'danger')
             return redirect(url_for('bank_import'))
-        os.makedirs(BANK_IMPORT_SOURCES[source], exist_ok=True)
-        upload.save(os.path.join(BANK_IMPORT_SOURCES[source], filename))
-        flash(f'Added {filename} to the {BANK_IMPORT_SOURCE_LABELS[source]} folder.', 'info')
+        os.makedirs(config['folder'], exist_ok=True)
+        upload.save(os.path.join(config['folder'], filename))
+        flash(f"Added {filename} to the {config['label']} folder.", 'info')
 
     settings = parse_bank_import_settings_from_form(source)
     error = validate_bank_import_settings(db, current_user.id, source, settings)
@@ -4017,7 +4807,7 @@ def bank_import_confirm():
     set_user_setting(db, current_user.id, f'bank_import.{source}', settings)
     db.commit()
 
-    label = BANK_IMPORT_SOURCE_LABELS[source]
+    label = BANK_IMPORT_SOURCES[source]['label']
     flash(
         f'{label}: imported {imported} new, updated {updated} existing'
         + (f', migrated {migrated} legacy' if migrated else '')
@@ -4039,6 +4829,154 @@ def bank_import_confirm():
         flash(f'There were {len(errors)} errors during import.', 'danger')
 
     return redirect(url_for('transactions'))
+
+
+def build_mintos_import_context(db, user_id):
+    investment_accounts = get_investment_accounts(db, user_id)
+    mintos_holdings = db.execute(
+        '''SELECT h.id, h.account_id, h.asset_name, a.name AS account_name
+           FROM investment_holdings h
+           JOIN accounts a ON a.id = h.account_id
+           WHERE h.user_id = ? AND h.asset_class = 'Mintos Lending'
+           ORDER BY a.name, h.asset_name''',
+        (user_id,),
+    ).fetchall()
+    settings = get_user_setting(db, user_id, 'mintos_import', {}) or {}
+    return investment_accounts, mintos_holdings, list_mintos_files(), settings
+
+
+def parse_mintos_import_settings(db, user_id):
+    """Read + validate the Mintos import form. Returns (settings, error)."""
+    account_id = request.form.get('account_id', type=int)
+    holding_id = request.form.get('holding_id', type=int)
+    create_holding = request.form.get('create_holding') == 'on'
+    if not account_id:
+        return None, 'Select an investment account.'
+    valid_account_ids = {acc['id'] for acc in get_investment_accounts(db, user_id)}
+    if account_id not in valid_account_ids:
+        return None, 'Invalid investment account selected.'
+    if holding_id:
+        owned = db.execute(
+            '''SELECT id FROM investment_holdings
+               WHERE id = ? AND user_id = ? AND account_id = ? AND asset_class = 'Mintos Lending' ''',
+            (holding_id, user_id, account_id),
+        ).fetchone()
+        if not owned:
+            return None, 'Invalid Mintos holding selected.'
+    return {'account_id': account_id, 'holding_id': holding_id, 'create_holding': create_holding}, None
+
+
+@app.route('/import/mintos')
+@login_required
+def mintos_import():
+    db = get_db()
+    investment_accounts, mintos_holdings, files, settings = build_mintos_import_context(db, current_user.id)
+    return render_template(
+        'import_mintos.html',
+        investment_accounts=investment_accounts,
+        mintos_holdings=mintos_holdings,
+        files=files,
+        settings=settings,
+        preview=None,
+        preview_settings_json=None,
+    )
+
+
+@app.route('/import/mintos/preview', methods=['POST'])
+@login_required
+def mintos_import_preview():
+    db = get_db()
+    upload = request.files.get('new_file')
+    if upload and upload.filename:
+        filename = secure_filename(upload.filename)
+        if not filename.lower().endswith(MINTOS_EXTENSIONS):
+            flash(f"Only {' / '.join(MINTOS_EXTENSIONS)} files can be added here.", 'danger')
+            return redirect(url_for('mintos_import'))
+        os.makedirs(MINTOS_FOLDER, exist_ok=True)
+        upload.save(os.path.join(MINTOS_FOLDER, filename))
+        flash(f'Added {filename} to the Mintos folder.', 'info')
+
+    settings, error = parse_mintos_import_settings(db, current_user.id)
+    if error:
+        flash(error, 'danger')
+        return redirect(url_for('mintos_import'))
+
+    try:
+        plan = build_mintos_import_plan(
+            db, current_user.id, settings['account_id'], settings['holding_id'], settings['create_holding']
+        )
+    except ValueError as exc:
+        flash(str(exc), 'danger')
+        return redirect(url_for('mintos_import'))
+
+    investment_accounts, mintos_holdings, files, _ = build_mintos_import_context(db, current_user.id)
+    return render_template(
+        'import_mintos.html',
+        investment_accounts=investment_accounts,
+        mintos_holdings=mintos_holdings,
+        files=files,
+        settings=settings,
+        preview=plan,
+        preview_settings_json=json.dumps(settings),
+    )
+
+
+@app.route('/import/mintos/confirm', methods=['POST'])
+@login_required
+def mintos_import_confirm():
+    db = get_db()
+    try:
+        settings = json.loads(request.form.get('settings_json') or '{}')
+        if not isinstance(settings, dict):
+            raise ValueError
+    except ValueError:
+        flash('Invalid import settings.', 'danger')
+        return redirect(url_for('mintos_import'))
+
+    account_id = settings.get('account_id')
+    valid_account_ids = {acc['id'] for acc in get_investment_accounts(db, current_user.id)}
+    if account_id not in valid_account_ids:
+        flash('Invalid investment account selected.', 'danger')
+        return redirect(url_for('mintos_import'))
+
+    holding = None
+    holding_id = settings.get('holding_id')
+    if holding_id:
+        holding = db.execute(
+            '''SELECT * FROM investment_holdings
+               WHERE id = ? AND user_id = ? AND account_id = ? AND asset_class = 'Mintos Lending' ''',
+            (holding_id, current_user.id, account_id),
+        ).fetchone()
+    if not holding:
+        holding = find_or_create_mintos_holding(
+            db, current_user.id, account_id, create_if_missing=bool(settings.get('create_holding'))
+        )
+    if not holding:
+        flash('No Mintos Lending holding in that account. Enable "create holding" or pick one.', 'danger')
+        return redirect(url_for('mintos_import'))
+
+    try:
+        plan = build_mintos_import_plan(
+            db, current_user.id, account_id, holding['id'], bool(settings.get('create_holding'))
+        )
+    except ValueError as exc:
+        flash(str(exc), 'danger')
+        return redirect(url_for('mintos_import'))
+
+    result = import_mintos_statement(db, current_user.id, holding, plan)
+    set_user_setting(db, current_user.id, 'mintos_import', {
+        'account_id': account_id,
+        'holding_id': holding['id'],
+        'create_holding': bool(settings.get('create_holding')),
+    })
+    db.commit()
+
+    flash(
+        f"Mintos: added {result['deposits_created']} deposit(s); "
+        f"value {result['valuation_action']} at {format_currency(plan['current_total_value'], plan['currency'])}.",
+        'success',
+    )
+    return redirect(url_for('investments'))
 
 
 @app.route('/import', methods=['GET', 'POST'])

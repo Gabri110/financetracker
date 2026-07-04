@@ -40,7 +40,7 @@
                         {% endfor %}
                     </ul>
                     {% else %}
-                    <div class="form-text">No CSV files found in <code>data/raw/{{ source_key }}/</code>. Upload one below.</div>
+                    <div class="form-text">No {{ source.extensions | join(' / ') }} files found in <code>{{ source.folder }}/</code>. Upload one below.</div>
                     {% endif %}
                 </div>
 
@@ -49,10 +49,10 @@
 
                     <div class="mb-3">
                         <label class="form-label">Add another export (optional)</label>
-                        <input type="file" class="form-control" name="new_file" accept=".csv">
+                        <input type="file" class="form-control" name="new_file" accept="{{ source.extensions | join(',') }}">
                     </div>
 
-                    {% if source_key == 'revolut' %}
+                    {% if source.multi_currency %}
                     {% if source.currencies %}
                     <div class="mb-3">
                         <span class="form-label fw-bold">Currencies found</span>
@@ -88,7 +88,7 @@
                     {% endif %}
                     {% else %}
                     <div class="mb-3">
-                        <label class="form-label">Cash account *</label>
+                        <label class="form-label">{% if source.investments %}Cash account{% else %}Account{% endif %} *</label>
                         <select class="form-select" name="account_id" required>
                             <option value="">Select account...</option>
                             {% for account in accounts %}
@@ -99,6 +99,7 @@
                             {% endfor %}
                         </select>
                     </div>
+                    {% if source.investments %}
                     <div class="mb-3">
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="create_investments_{{ source_key }}" name="create_investments"
@@ -121,11 +122,22 @@
                         {% endif %}
                     </div>
                     {% endif %}
+                    {% endif %}
 
                     <div class="mb-3">
                         <label class="form-label">Only import from date (optional)</label>
                         <input type="date" class="form-control" name="from_date" value="{{ settings.from_date or '' }}">
                         <div class="form-text">Re-importing overlapping data is safe: rows are matched by transaction ID.</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="transfer_patterns_{{ source_key }}">Treat as transfer (optional, one pattern per line)</label>
+                        <textarea class="form-control" id="transfer_patterns_{{ source_key }}" name="transfer_patterns" rows="2"
+                                  placeholder="e.g. Iberia Cards">{{ (settings.transfer_patterns or []) | join('\n') }}</textarea>
+                        <div class="form-text">
+                            Rows whose description or payee contains one of these texts (case-insensitive) are imported as transfers,
+                            so they don't count as income/expense — e.g. a credit-card bill paid from this account.
+                        </div>
                     </div>
 
                     <button type="submit" class="btn btn-primary" {% if not source.files %}disabled{% endif %}>
@@ -191,6 +203,9 @@
                     {% endfor %}
                     {% if preview.skipped_before_date %}
                     <li>{{ preview.skipped_before_date }} rows skipped (before from-date)</li>
+                    {% endif %}
+                    {% if preview.pattern_transfers %}
+                    <li>{{ preview.pattern_transfers }} rows marked as transfer by your patterns</li>
                     {% endif %}
                     {% if preview.legacy_matches %}
                     <li>{{ preview.legacy_matches }} previously imported transactions will be migrated to the new IDs (no duplicates)</li>

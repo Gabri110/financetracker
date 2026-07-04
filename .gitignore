@@ -4,6 +4,14 @@ finance.db
 !**/revolut/.gitkeep
 **/trade_republic/*
 !**/trade_republic/.gitkeep
+**/B100/*
+!**/B100/.gitkeep
+**/edenred/*
+!**/edenred/.gitkeep
+**/iberia_cards/*
+!**/iberia_cards/.gitkeep
+**/mintos/*
+!**/mintos/.gitkeep
 .DS_Store
 .claude/
 
