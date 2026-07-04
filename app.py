@@ -75,6 +75,10 @@ BANK_IMPORT_SOURCES = {
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
+        # Restaurant-card spending is food; mobility-card spending is transport.
+        # Auto-applied to expense rows (matched by category name) unless a user
+        # rule already categorises the row.
+        'default_category': 'Restaurantes',
     },
     'edenred_mobility': {
         'label': 'Edenred Movilidad',
@@ -82,6 +86,7 @@ BANK_IMPORT_SOURCES = {
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
+        'default_category': 'Transporte',
     },
     'iberia_cards': {
         'label': 'Iberia Cards',
@@ -3605,23 +3610,15 @@ def _edenred_format_a_min_date(folder, product_token):
         if not name.lower().endswith('.xlsx'):
             continue
         path = os.path.join(folder, name)
+        if _edenred_file_product(path) != product_token:
+            continue
         try:
             worksheet = load_xlsx_worksheet(path)
         except Exception:
             continue
         rows = list(worksheet.iter_rows(values_only=True))
-        if _edenred_format_b_product(rows, path) is not None:
+        if _edenred_is_format_b(rows):
             continue  # Format-B file, not Format A
-        product = ''
-        for raw_row in rows:
-            cells = list(raw_row) + [None] * 3
-            first = str(cells[0] or '').strip()
-            if first.lower().startswith('producto'):
-                product = str(cells[1] or '').strip().lower()
-            elif first == 'Fecha':
-                break
-        if product_token not in product:
-            continue
         for date in _edenred_format_a_dates(rows):
             if min_date is None or date < min_date:
                 min_date = date
@@ -3645,51 +3642,53 @@ def _edenred_format_a_dates(rows):
             yield date
 
 
-def _edenred_format_b_product(rows, path):
-    """Return 'restaurant'/'movilidad' if these rows look like a Format-B
-    ('Sheet1') export, else None. Format B has no in-sheet 'Producto:' marker, so
-    product is decided by header shape and confirmed by filename."""
-    if not rows:
-        return None
-    header = [str(c or '') for c in (list(rows[0]) + [None] * 5)[:5]]
-    # Restaurant B: 'Num. Tarjeta | Usuario | Tipo de Operación | Fecha Operación | Monto'
-    if 'Num. Tarjeta' in header[0] and any('Monto' in cell for cell in header):
-        return 'restaurant'
-    # Mobility B: 'Tipo de Operación | Monto | Fecha Ejecución' (mojibake-tolerant)
-    if 'Tipo de Operaci' in header[0] and any('Monto' in cell for cell in header):
+def _edenred_file_product(path):
+    """Which Edenred product a file belongs to, decided by its filename
+    ('...Movilidad...' -> movilidad, '...Restaurante...' -> restaurant). The
+    filename is authoritative for routing each export to the right account."""
+    name = os.path.basename(path).lower()
+    if 'movilidad' in name:
         return 'movilidad'
+    if 'restaurante' in name:
+        return 'restaurant'
     return None
 
 
+def _edenred_is_format_b(rows):
+    """True for the plain 'Sheet1' export (signed amounts, no merchant text) vs
+    the 'Movimientos' export (Format A). Layout family only, product-agnostic."""
+    if not rows:
+        return False
+    header = [str(c or '') for c in (list(rows[0]) + [None] * 5)[:5]]
+    return 'Num. Tarjeta' in header[0] or 'Tipo de Operaci' in header[0]
+
+
 def parse_edenred_xlsx(path, product_token):
-    """Parse an Edenred movements export. Two layouts exist: Format A
-    ('Movimientos' sheet, 'Producto:' header, rich merchant text) and Format B
-    ('Sheet1', signed amounts, no merchant text but longer history)."""
+    """Parse an Edenred movements export. Files are routed to a product by their
+    filename; two layouts exist: Format A ('Movimientos' sheet, rich merchant
+    text) and Format B ('Sheet1', signed amounts, no merchant, longer history)."""
+    if _edenred_file_product(path) != product_token:
+        return {'rows': [], 'investment_rows': [], 'skipped': {}}
     worksheet = load_xlsx_worksheet(path)
     rows = list(worksheet.iter_rows(values_only=True))
-    if _edenred_format_b_product(rows, path) is not None:
+    if _edenred_is_format_b(rows):
         return _parse_edenred_format_b(path, rows, product_token)
     return _parse_edenred_format_a(rows, product_token)
 
 
 def _parse_edenred_format_a(rows, product_token):
-    """Format A: 'Producto:' header row identifies the product; rows from other
-    products are ignored so each Edenred source only picks up its own files."""
+    """Format A ('Movimientos'): the table starts at a 'Fecha' header row; rows
+    carry rich merchant text. The file was already routed by filename."""
     out = []
     skipped = defaultdict(int)
     occurrences = defaultdict(int)
 
-    product = ''
     in_table = False
     for raw_row in rows:
         cells = list(raw_row) + [None] * 3
         first = str(cells[0] or '').strip()
         if not in_table:
-            if first.lower().startswith('producto'):
-                product = str(cells[1] or '').strip().lower()
-            elif first == 'Fecha':
-                if product_token not in product:
-                    return {'rows': [], 'investment_rows': [], 'skipped': {}}
+            if first == 'Fecha':
                 in_table = True
             continue
 
@@ -3736,13 +3735,10 @@ def _parse_edenred_format_b(path, rows, product_token):
     """Format B ('Sheet1'): signed amounts, no merchant text. Used to backfill the
     older history Format A doesn't reach; rows already covered by a Format-A file
     (date >= that file's earliest date) are skipped so the richer A row wins."""
-    file_product = _edenred_format_b_product(rows, path)
-    if file_product != product_token:
-        return {'rows': [], 'investment_rows': [], 'skipped': {}}
-
+    # Column layout depends on the product (the file was routed by filename).
     # Mobility B: type(0) | monto(1) | fecha(2).  Restaurant B has the amount and
     # date shifted right (num/usuario prefix columns).
-    if file_product == 'restaurant':
+    if product_token == 'restaurant':
         type_idx, date_idx, amount_idx = 2, 3, 4
     else:
         type_idx, date_idx, amount_idx = 0, 2, 1
@@ -4289,7 +4285,13 @@ def build_bank_import_plan(db, user_id, source, settings):
             if pattern_forced:
                 pattern_transfers += 1
 
-        prepared.append({**row, 'account_id': account['id']})
+        prepared_row = {**row, 'account_id': account['id']}
+        # Source-level default category (e.g. Edenred food/transport) applied to
+        # spending rows that the parser left uncategorised; a matching user rule
+        # in upsert_bank_transactions still takes precedence.
+        if config.get('default_category') and not prepared_row['category_text'] and row['transaction_type'] == 'expense':
+            prepared_row['category_text'] = config['default_category']
+        prepared.append(prepared_row)
 
     # Count old-script imports (raw Revolut id) that the confirm step will
     # migrate in place to the new legId-based ids.
