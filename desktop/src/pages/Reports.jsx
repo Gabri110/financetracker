@@ -7,11 +7,9 @@ import {
   ArcElement, Title, Tooltip, Legend,
 } from "chart.js";
 import { getMonthlyData, getCategorySpending, getTopPayees, getBaseCurrency } from "../api/tauri";
+import { fmt } from "../format";
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Title, Tooltip, Legend);
-
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 export default function Reports() {
   const { t } = useTranslation();

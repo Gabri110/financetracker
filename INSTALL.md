@@ -1,132 +1,55 @@
-# FinanceTracker Server Installation Guide
+# FinanceTracker Installation Guide
 
-## Local Development
+FinanceTracker is built for one person on their own machine. The defaults (localhost binding, registration closing after the first user) assume that; read **Exposing it to a network** before doing anything else.
 
-**Requirements:** Python 3.9+
+## Local
+
+**Requirements:** Python 3.11+
 
 ```bash
-git clone https://github.com/youruser/financetracker.git
+git clone https://github.com/Gabri110/financetracker.git
 cd financetracker
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python app.py
 ```
 
-The app will be available at `http://localhost:8000`. Register your first user account to get started. The SQLite database is created automatically at `finance.db` in the project root.
+The app runs at `http://localhost:8000`. Register your account to get started; registration then closes. The SQLite database is created at `finance.db`, and a random session key at `instance/secret_key`.
 
-## Docker Self-Hosted
-
-```bash
-docker-compose up -d
-```
-
-Data is persisted via a Docker volume. To use a bind mount instead, edit `docker-compose.yml` and map a host directory to `/app/data`.
-
-Configure the instance with environment variables in a `.env` file or directly in `docker-compose.yml`:
-
-```yaml
-environment:
-  - SECRET_KEY=your-random-secret-key
-  - DATABASE=/app/data/finance.db
-  - REGISTRATION_ENABLED=true
-```
-
-## Production Deployment (VPS/Cloud)
-
-### Gunicorn
-
-Install gunicorn in your virtual environment:
+## Docker
 
 ```bash
-pip install gunicorn
-gunicorn -w 4 -b 127.0.0.1:8000 app:app
+docker compose up -d
 ```
 
-### systemd Service
+The app listens on `http://localhost:8000` (bound to `127.0.0.1` only). Everything it stores lives on the `finance_data` volume mounted at `/data`:
 
-Create `/etc/systemd/system/financetracker.service`:
+- `/data/finance.db`: the database
+- `/data/secret_key`: the generated session key
+- `/data/raw/<bank>/`: bank-statement drop folders
 
-```ini
-[Unit]
-Description=FinanceTracker
-After=network.target
+To use a host folder instead of a named volume, map it to `/data` in `docker-compose.yml`.
 
-[Service]
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/financetracker
-Environment="PATH=/opt/financetracker/venv/bin"
-EnvironmentFile=/opt/financetracker/.env
-ExecStart=/opt/financetracker/venv/bin/gunicorn -w 4 -b 127.0.0.1:8000 app:app
-Restart=always
+## Environment Variables
 
-[Install]
-WantedBy=multi-user.target
-```
+All optional; a `.env` file in the project root is loaded automatically.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now financetracker
-```
-
-### Nginx Reverse Proxy
-
-```nginx
-server {
-    listen 80;
-    server_name finance.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-### SSL with Let's Encrypt
-
-```bash
-sudo apt install certbot python3-certbot-nginx
-sudo certbot --nginx -d finance.example.com
-```
-
-Certbot will automatically update the nginx config to handle HTTPS and set up auto-renewal.
-
-## SaaS Mode
-
-SaaS mode enables the public landing page at `/`, multi-tenant support, and Stripe billing integration. The landing page is only visible when `SAAS_MODE=true` is set; otherwise, `/` redirects to the login page.
-
-Deploy using the SaaS-specific compose file:
-
-```bash
-docker-compose -f docker-compose.saas.yml up -d
-```
-
-Required environment variables for SaaS mode:
-
-```bash
-SAAS_MODE=true
-SAAS_DOMAIN=app.example.com
-EMAIL_DOMAIN=example.com
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_PUBLISHABLE_KEY=pk_live_...
-```
-
-### Tenant Provisioning
-
-New tenants are provisioned automatically on signup through Stripe, or manually:
-
-```bash
-python provision.py --tenant acme --email admin@acme.com
-```
+| Variable | Default | Description |
+|---|---|---|
+| `SECRET_KEY` | generated | Session signing key. When unset, a random key is created once and stored in `SECRET_KEY_FILE`. |
+| `SECRET_KEY_FILE` | `instance/secret_key` | Where the generated key is kept (`/data/secret_key` in Docker). |
+| `DATABASE` | `finance.db` | Path to the SQLite database file. |
+| `DATA_DIR` | `data` | Folder holding the `raw/<bank>/` statement drop folders. |
+| `REGISTRATION_ENABLED` | `false` | `true` keeps registration open after the first user exists. |
+| `FLASK_DEBUG` | off | `1` enables the Flask debugger when running `python app.py`. Never on a reachable host. |
+| `ENABLE_BANKING_APP_ID` | — | Enable Banking application id (Sync page, Bankinter/ING). |
+| `ENABLE_BANKING_KEY_PATH` | — | Path to that application's private key `.pem` (keep it outside the repository). |
+| `ENABLE_BANKING_REDIRECT_URL` | `http://localhost:8000/sync/callback` | Redirect URL registered in Enable Banking. |
 
 ## Sync connectors (`/sync`)
 
-The Sync page fetches data per source, writes it to `data/raw/<source>/` and imports it with
+The Sync page fetches data per source, writes it to `DATA_DIR/raw/<source>/` and imports it with
 the settings saved by your last manual import on **Bank Import** (do one manual import per
 source first, to map its accounts). Back up `finance.db` before the first sync.
 
@@ -144,51 +67,55 @@ source first, to map its accounts). Back up `finance.db` before the first sync.
      accepted, register any URL you own and use "Bank redirect didn't come back?" on the Sync
      page to paste the address you land on).
   3. Activate the app by linking your Bankinter/ING accounts in the Control Panel.
-  4. Set the variables before starting the app (the app does not read `.env` by itself), e.g.
-     in PowerShell: `$env:ENABLE_BANKING_APP_ID="<app id>"; $env:ENABLE_BANKING_KEY_PATH="C:\keys\eb.pem"`.
+  4. Set `ENABLE_BANKING_APP_ID` and `ENABLE_BANKING_KEY_PATH` in `.env` (loaded at start-up),
+     e.g. `ENABLE_BANKING_KEY_PATH=C:\keys\eb.pem`, then restart the app.
   5. On the Sync page click **Connect**, log in at the bank, then **Fetch**. Consent lasts up to
      180 days; the page warns two weeks before it expires.
 - **Edenred, Mintos** — no API: upload the export on the Sync page.
 
-## Environment Variables Reference
+## Exposing it to a network
 
-| Variable | Default | Description |
-|---|---|---|
-| `SECRET_KEY` | (generated) | Flask secret key for session signing. Set a strong random value in production. |
-| `DATABASE` | `finance.db` | Path to the SQLite database file. |
-| `SAAS_MODE` | `false` | Set to `true` to enable the landing page, multi-tenant mode, and Stripe billing. |
-| `REGISTRATION_ENABLED` | `true` | Set to `false` to prevent new user signups. |
-| `SAAS_DOMAIN` | — | Primary domain for the SaaS instance. |
-| `EMAIL_DOMAIN` | — | Domain used for outbound email. |
-| `STRIPE_SECRET_KEY` | — | Stripe secret API key (SaaS mode). |
-| `STRIPE_PUBLISHABLE_KEY` | — | Stripe publishable API key (SaaS mode). |
-| `ENABLE_BANKING_APP_ID` | — | Enable Banking application id (Sync page, Bankinter/ING). |
-| `ENABLE_BANKING_KEY_PATH` | — | Path to that application's private key `.pem`. |
-| `ENABLE_BANKING_REDIRECT_URL` | `http://localhost:8000/sync/callback` | Redirect URL registered in Enable Banking. |
+The app protects a single local user, not several users from each other: bank-statement folders and exchange rates are shared, and form IDs are not ownership-checked. If you still want to reach it from other devices:
+
+1. Keep registration closed (`REGISTRATION_ENABLED` unset).
+2. Run it with gunicorn behind a TLS reverse proxy and keep the app port bound to `127.0.0.1`.
+
+```bash
+gunicorn -w 2 -b 127.0.0.1:8000 app:app
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name finance.example.com;
+    # ssl_certificate ... (e.g. via certbot --nginx)
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+The proxy must pass the original `Host` header: the CSRF check compares it with the browser's `Origin`.
 
 ## Backup
 
-The entire application state lives in the SQLite database file. To back up:
+The whole application state lives in the SQLite database. Either:
 
-```bash
-cp finance.db finance.db.bak
-```
+- download it from **Options → Download database backup**, or
+- copy it safely while the app runs: `sqlite3 finance.db ".backup finance-backup.db"`
 
-For automated backups, schedule a cron job or use `sqlite3 finance.db ".backup /path/to/backup.db"` for a safe online backup.
+To restore, stop the app and replace `finance.db` with the backup. Schema migrations run automatically on the next start.
 
 ## Updating
 
 ```bash
 git pull
-source venv/bin/activate
 pip install -r requirements.txt
-sudo systemctl restart financetracker
+python app.py        # or restart your service / `docker compose up -d --build`
 ```
 
-For Docker deployments:
-
-```bash
-docker-compose down
-docker-compose pull
-docker-compose up -d
-```
+Database migrations (tracked with `PRAGMA user_version`) run on first request after an update; back up `finance.db` first.

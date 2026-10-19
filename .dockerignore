@@ -1,0 +1,17 @@
+# Keep personal data, VCS and local tooling out of the Docker build context.
+.git
+.github
+.venv
+.claude
+__pycache__
+*.pyc
+finance.db*
+*.db
+*.zip
+instance/
+data/
+desktop/
+tests/
+.env
+*.pem
+.DS_Store

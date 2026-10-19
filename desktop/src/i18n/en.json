@@ -83,7 +83,7 @@
     "currency": "Currency",
     "balance": "Balance",
     "noAccounts": "No accounts yet. Add one to get started.",
-    "deleteConfirm": "Delete this account?",
+    "deleteConfirm": "Delete this account and all its transactions?",
     "accountUpdated": "Account updated.",
     "accountAdded": "Account added.",
     "types": {
@@ -118,7 +118,7 @@
     "newCategory": "New Category",
     "icon": "Icon",
     "color": "Color",
-    "deleteConfirm": "Delete this category?",
+    "deleteConfirm": "Delete this category? Its transactions become uncategorized and its rules and budgets are removed.",
     "categoryUpdated": "Category updated.",
     "categoryAdded": "Category added."
   },

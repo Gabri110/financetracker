@@ -119,11 +119,15 @@ pub fn update_account(
 pub fn delete_account(state: tauri::State<AppState>, id: i64) -> Result<(), String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM accounts WHERE id=?1", params![id])
+    // Transactions reference the account (foreign keys are on), so they go first.
+    tx.execute("DELETE FROM transactions WHERE account_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM accounts WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

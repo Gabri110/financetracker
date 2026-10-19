@@ -18,7 +18,7 @@
                             <select class="form-select" id="account_id" name="account_id" required>
                                 <option value="">Select account...</option>
                                 {% for account in investment_accounts %}
-                                <option value="{{ account.id }}">{{ account.name }} ({{ account.currency }})</option>
+                                <option value="{{ account.id }}" data-currency="{{ account.currency }}">{{ account.name }} ({{ account.currency }})</option>
                                 {% endfor %}
                             </select>
                         </div>
@@ -38,7 +38,7 @@
                         <select class="form-select" id="holding_id" name="holding_id">
                             <option value="">Select holding...</option>
                             {% for holding in holdings %}
-                            <option value="{{ holding.id }}" data-account-id="{{ holding.account_id }}" data-asset-class="{{ holding.asset_class }}">{{ holding.asset_name }} ({{ holding.account_name }})</option>
+                            <option value="{{ holding.id }}" data-account-id="{{ holding.account_id }}" data-asset-class="{{ holding.asset_class }}" data-currency="{{ holding.currency }}">{{ holding.asset_name }} ({{ holding.account_name }})</option>
                             {% endfor %}
                         </select>
                         <div class="form-text" id="holding-help">Required for buy/sell and for reinvested dividends.</div>
@@ -68,8 +68,9 @@
                         <div class="col-md-6 mb-3">
                             <label for="currency" class="form-label">Currency *</label>
                             <select class="form-select" id="currency" name="currency" required>
-                                {% for c in ['EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'MXN'] %}
-                                <option value="{{ c }}" {% if c == 'USD' %}selected{% endif %}>{{ c }}</option>
+                                {% set default_currency = user_base_currency() %}
+                                {% for c in supported_currencies %}
+                                <option value="{{ c }}" {% if c == default_currency %}selected{% endif %}>{{ c }}</option>
                                 {% endfor %}
                             </select>
                         </div>
@@ -193,9 +194,20 @@
         });
     }
 
+    const currencySelect = document.getElementById('currency');
+
+    // Default the operation currency to the holding's (or account's) currency.
+    function syncCurrency(select) {
+        const selected = select.options[select.selectedIndex];
+        const code = selected ? selected.dataset.currency : '';
+        if (code && [...currencySelect.options].some((option) => option.value === code)) {
+            currencySelect.value = code;
+        }
+    }
+
     operationType.addEventListener('change', syncDividendState);
-    accountSelect.addEventListener('change', filterHoldingsByAccount);
-    holdingSelect.addEventListener('change', syncDividendState);
+    accountSelect.addEventListener('change', () => { filterHoldingsByAccount(); syncCurrency(accountSelect); });
+    holdingSelect.addEventListener('change', () => { syncDividendState(); syncCurrency(holdingSelect); });
     quantityInput.addEventListener('input', syncAutoAmount);
     priceInput.addEventListener('input', syncAutoAmount);
 

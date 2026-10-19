@@ -1,9 +1,9 @@
-flask>=3.0.0
+flask>=3.1.0
 flask-login>=0.6.3
-werkzeug>=3.0.0
-gunicorn>=21.0.0
-stripe>=7.0.0
+werkzeug>=3.0.6
+gunicorn>=22.0.0
 openpyxl>=3.1.0
+python-dotenv>=1.0.0
 requests>=2.31.0
 PyJWT[crypto]>=2.8.0
 pytr==0.4.10

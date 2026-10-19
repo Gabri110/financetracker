@@ -10,24 +10,24 @@ pub struct AppState {
     pub db_path: Mutex<Option<String>>,
 }
 
-#[tauri::command]
-fn open_db(state: tauri::State<AppState>, path: String) -> Result<(), String> {
+fn activate_db(state: &AppState, path: String) -> Result<(), String> {
     let conn = db::open_database(&path).map_err(|e| e.to_string())?;
     let mut db_guard = state.db.lock().map_err(|e| e.to_string())?;
     let mut path_guard = state.db_path.lock().map_err(|e| e.to_string())?;
     *db_guard = Some(conn);
-    *path_guard = Some(path);
+    *path_guard = Some(path.clone());
+    commands::fx::spawn_daily_rate_sync(path);
     Ok(())
 }
 
 #[tauri::command]
+fn open_db(state: tauri::State<AppState>, path: String) -> Result<(), String> {
+    activate_db(&state, path)
+}
+
+#[tauri::command]
 fn create_db(state: tauri::State<AppState>, path: String) -> Result<(), String> {
-    let conn = db::open_database(&path).map_err(|e| e.to_string())?;
-    let mut db_guard = state.db.lock().map_err(|e| e.to_string())?;
-    let mut path_guard = state.db_path.lock().map_err(|e| e.to_string())?;
-    *db_guard = Some(conn);
-    *path_guard = Some(path);
-    Ok(())
+    activate_db(&state, path)
 }
 
 #[tauri::command]
@@ -61,12 +61,7 @@ fn open_demo_db(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<
     let path_str = dest.to_string_lossy().to_string();
 
     // Open the copied demo database
-    let conn = db::open_database(&path_str).map_err(|e| e.to_string())?;
-    let mut db_guard = state.db.lock().map_err(|e| e.to_string())?;
-    let mut path_guard = state.db_path.lock().map_err(|e| e.to_string())?;
-    *db_guard = Some(conn);
-    *path_guard = Some(path_str.clone());
-
+    activate_db(&state, path_str.clone())?;
     Ok(path_str)
 }
 

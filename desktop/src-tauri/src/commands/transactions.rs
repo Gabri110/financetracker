@@ -1,5 +1,5 @@
 use crate::AppState;
-use rusqlite::params;
+use rusqlite::{params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -79,53 +79,55 @@ pub fn get_transactions(
          WHERE 1=1",
     );
 
-    let mut conditions: Vec<String> = Vec::new();
+    // Every filter value is bound as a parameter, never spliced into the SQL.
+    let mut values: Vec<Value> = Vec::new();
 
     if let Some(ref f) = filter {
         if let Some(aid) = f.account_id {
-            conditions.push(format!("t.account_id = {}", aid));
+            sql.push_str(" AND t.account_id = ?");
+            values.push(Value::Integer(aid));
         }
         if let Some(cid) = f.category_id {
-            conditions.push(format!("t.category_id = {}", cid));
+            sql.push_str(" AND t.category_id = ?");
+            values.push(Value::Integer(cid));
         }
         if let Some(ref tt) = f.transaction_type {
-            conditions.push(format!("t.transaction_type = '{}'", tt.replace('\'', "''")));
+            sql.push_str(" AND t.transaction_type = ?");
+            values.push(Value::Text(tt.clone()));
         }
         if let Some(ref s) = f.search {
-            let escaped = s.replace('\'', "''");
-            conditions.push(format!(
-                "(t.description LIKE '%{}%' OR t.payee LIKE '%{}%')",
-                escaped, escaped
-            ));
+            // Escape LIKE wildcards so '%' and '_' in the search box match literally.
+            let escaped = s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let pattern = format!("%{}%", escaped);
+            sql.push_str(" AND (t.description LIKE ? ESCAPE '\\' OR t.payee LIKE ? ESCAPE '\\')");
+            values.push(Value::Text(pattern.clone()));
+            values.push(Value::Text(pattern));
         }
         if let Some(ref df) = f.date_from {
-            conditions.push(format!("t.date >= '{}'", df.replace('\'', "''")));
+            sql.push_str(" AND t.date >= ?");
+            values.push(Value::Text(df.clone()));
         }
         if let Some(ref dt) = f.date_to {
-            conditions.push(format!("t.date <= '{}'", dt.replace('\'', "''")));
+            sql.push_str(" AND t.date <= ?");
+            values.push(Value::Text(dt.clone()));
         }
-    }
-
-    for cond in &conditions {
-        sql.push_str(" AND ");
-        sql.push_str(cond);
     }
 
     sql.push_str(" ORDER BY t.date DESC, t.id DESC");
 
     if let Some(ref f) = filter {
-        if let Some(limit) = f.limit {
-            sql.push_str(&format!(" LIMIT {}", limit));
-        }
-        if let Some(offset) = f.offset {
-            sql.push_str(&format!(" OFFSET {}", offset));
+        if f.limit.is_some() || f.offset.is_some() {
+            // SQLite only accepts OFFSET after a LIMIT; -1 means "no limit".
+            sql.push_str(" LIMIT ? OFFSET ?");
+            values.push(Value::Integer(f.limit.unwrap_or(-1)));
+            values.push(Value::Integer(f.offset.unwrap_or(0)));
         }
     }
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let transactions = stmt
-        .query_map([], |row| {
+        .query_map(params_from_iter(values.iter()), |row| {
             Ok(Transaction {
                 id: row.get(0)?,
                 id_transaction: row.get(1)?,
@@ -164,13 +166,16 @@ pub fn add_transaction(
 ) -> Result<Transaction, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    // Row + balance change commit together (an early `?` return rolls back).
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO transactions (account_id, category_id, transaction_type, amount, description, payee, date)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![account_id, category_id, transaction_type, amount, description, payee, date],
     )
     .map_err(|e| e.to_string())?;
+    let id = tx.last_insert_rowid();
 
     // Update account balance
     let delta = match transaction_type.as_str() {
@@ -179,14 +184,14 @@ pub fn add_transaction(
         _ => 0.0,
     };
     if delta != 0.0 {
-        conn.execute(
+        tx.execute(
             "UPDATE accounts SET balance = balance + ?1 WHERE id = ?2",
             params![delta, account_id],
         )
         .map_err(|e| e.to_string())?;
     }
 
-    let id = conn.last_insert_rowid();
+    tx.commit().map_err(|e| e.to_string())?;
     fetch_transaction(conn, id)
 }
 
@@ -204,9 +209,10 @@ pub fn update_transaction(
 ) -> Result<Transaction, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
     // Reverse old balance effect
-    let (old_account_id, old_type, old_amount): (i64, String, f64) = conn
+    let (old_account_id, old_type, old_amount): (i64, String, f64) = tx
         .query_row(
             "SELECT account_id, transaction_type, amount FROM transactions WHERE id = ?1",
             params![id],
@@ -220,14 +226,14 @@ pub fn update_transaction(
         _ => 0.0,
     };
     if old_delta != 0.0 {
-        conn.execute(
+        tx.execute(
             "UPDATE accounts SET balance = balance + ?1 WHERE id = ?2",
             params![old_delta, old_account_id],
         )
         .map_err(|e| e.to_string())?;
     }
 
-    conn.execute(
+    tx.execute(
         "UPDATE transactions SET account_id=?1, category_id=?2, transaction_type=?3,
          amount=?4, description=?5, payee=?6, date=?7 WHERE id=?8",
         params![account_id, category_id, transaction_type, amount, description, payee, date, id],
@@ -241,13 +247,14 @@ pub fn update_transaction(
         _ => 0.0,
     };
     if new_delta != 0.0 {
-        conn.execute(
+        tx.execute(
             "UPDATE accounts SET balance = balance + ?1 WHERE id = ?2",
             params![new_delta, account_id],
         )
         .map_err(|e| e.to_string())?;
     }
 
+    tx.commit().map_err(|e| e.to_string())?;
     fetch_transaction(conn, id)
 }
 
@@ -255,8 +262,9 @@ pub fn update_transaction(
 pub fn delete_transaction(state: tauri::State<AppState>, id: i64) -> Result<(), String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-    let (account_id, transaction_type, amount): (i64, String, f64) = conn
+    let (account_id, transaction_type, amount): (i64, String, f64) = tx
         .query_row(
             "SELECT account_id, transaction_type, amount FROM transactions WHERE id = ?1",
             params![id],
@@ -264,7 +272,7 @@ pub fn delete_transaction(state: tauri::State<AppState>, id: i64) -> Result<(), 
         )
         .map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM transactions WHERE id=?1", params![id])
+    tx.execute("DELETE FROM transactions WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
 
     let delta = match transaction_type.as_str() {
@@ -273,14 +281,14 @@ pub fn delete_transaction(state: tauri::State<AppState>, id: i64) -> Result<(), 
         _ => 0.0,
     };
     if delta != 0.0 {
-        conn.execute(
+        tx.execute(
             "UPDATE accounts SET balance = balance + ?1 WHERE id = ?2",
             params![delta, account_id],
         )
         .map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -295,6 +303,8 @@ pub fn import_csv(
 ) -> Result<ImportResult, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    // One transaction for the whole file: faster, and all-or-nothing on a hard error.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(has_header)
@@ -371,29 +381,32 @@ pub fn import_csv(
         let description = get_col("description");
         let payee = get_col("payee");
 
-        conn.execute(
+        if let Err(e) = tx.execute(
             "INSERT INTO transactions (account_id, transaction_type, amount, description, payee, date)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![account_id, final_type, actual_amount, description, payee, date],
-        )
-        .map_err(|e| {
+        ) {
+            // A failed row must not touch the balance or count as imported.
             errors.push(format!("Row {}: insert failed: {}", i + 1, e));
-        })
-        .ok();
+            skipped += 1;
+            continue;
+        }
 
-        let balance_delta = if final_type == "income" {
-            actual_amount
-        } else {
-            -actual_amount
+        let balance_delta = match final_type {
+            "income" => actual_amount,
+            "expense" => -actual_amount,
+            _ => 0.0,
         };
-        conn.execute(
+        tx.execute(
             "UPDATE accounts SET balance = balance + ?1 WHERE id = ?2",
             params![balance_delta, account_id],
         )
-        .ok();
+        .map_err(|e| e.to_string())?;
 
         imported += 1;
     }
+
+    tx.commit().map_err(|e| e.to_string())?;
 
     Ok(ImportResult {
         imported,

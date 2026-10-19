@@ -1,23 +1,20 @@
-# Personal data
+# Personal data (never commit: real financial data)
 finance.db
-**/revolut/*
-!**/revolut/.gitkeep
-**/trade_republic/*
-!**/trade_republic/.gitkeep
-**/B100/*
-!**/B100/.gitkeep
-**/edenred/*
-!**/edenred/.gitkeep
-**/iberia_cards/*
-!**/iberia_cards/.gitkeep
-**/mintos/*
-!**/mintos/.gitkeep
-**/myinvestor/*
-!**/myinvestor/.gitkeep
-**/bankinter/*
-!**/bankinter/.gitkeep
-**/ing/*
-!**/ing/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.bak*
+!desktop/src-tauri/resources/demo.db
+*.zip
+instance/
+# Bank statements: every folder under data/raw and data/processed, including new banks
+# (bankinter, ing, myinvestor, ...)
+data/raw/*/**
+!data/raw/*/.gitkeep
+data/processed/*/**
+!data/processed/*/.gitkeep
+# Enable Banking private keys (Sync page) must never be committed
 *.pem
 .DS_Store
 .claude/

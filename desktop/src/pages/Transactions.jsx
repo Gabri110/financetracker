@@ -5,9 +5,8 @@ import {
   getAccounts, getCategories,
 } from "../api/tauri";
 import Alert from "../components/Alert";
+import { fmt } from "../format";
 
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 const today = () => new Date().toISOString().slice(0, 10);
 
 const emptyForm = {

@@ -1,7 +1,6 @@
 use crate::AppState;
 use crate::commands::fx::{
     convert_amount_from_conn,
-    ensure_daily_rates_from_conn,
     get_base_currency_from_conn,
 };
 use rusqlite::params;
@@ -58,8 +57,6 @@ pub struct RecentTransaction {
 pub fn get_dashboard_stats(state: tauri::State<AppState>) -> Result<DashboardStats, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
-
-    ensure_daily_rates_from_conn(conn)?;
 
     let now = chrono::Local::now();
     let month_start = format!("{}-{:02}-01", now.format("%Y"), now.format("%m"));
@@ -148,8 +145,6 @@ pub fn get_monthly_data(
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
 
-    ensure_daily_rates_from_conn(conn)?;
-
     let base_currency = get_base_currency_from_conn(conn)?;
 
     let mut stmt = conn
@@ -206,8 +201,6 @@ pub fn get_category_spending(
 ) -> Result<Vec<CategorySpending>, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
-
-    ensure_daily_rates_from_conn(conn)?;
 
     let base_currency = get_base_currency_from_conn(conn)?;
 
@@ -273,8 +266,6 @@ pub fn get_top_payees(
 ) -> Result<Vec<TopPayee>, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
-
-    ensure_daily_rates_from_conn(conn)?;
 
     let base_currency = get_base_currency_from_conn(conn)?;
 

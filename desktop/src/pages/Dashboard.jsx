@@ -17,11 +17,9 @@ import {
   getRecentTransactions,
   getBaseCurrency,
 } from "../api/tauri";
+import { fmt } from "../format";
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
-
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 export default function Dashboard() {
   const { t } = useTranslation();

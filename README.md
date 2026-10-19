@@ -1,183 +1,98 @@
 # FinanceTracker
 
-A simple, powerful personal finance application similar to Quicken and Microsoft Money. Built with Python, Flask, and SQLite.
+A simple personal finance application in the spirit of Quicken and Microsoft Money. Built with Python, Flask, and SQLite, for one person running it on their own machine.
 
-![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
-![Flask](https://img.shields.io/badge/flask-3.0+-green.svg)
+![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
+![Flask](https://img.shields.io/badge/flask-3.1+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## Features
 
 ### Core Features
 - **Multi-Account Support** - Track checking, savings, credit cards, cash, and investments
-- **Transaction Management** - Add, edit, delete, and search transactions
-- **CSV Import** - Import bank statements with automatic format detection (US/European)
+- **Transaction Management** - Add, edit, delete, search and page through transactions
+- **Bank Imports** - Revolut, Trade Republic, Bankinter, ING, Edenred and Mintos statements (plus archived B100, Iberia Cards and MyInvestor exports), and a generic CSV import
+- **Sync page** - One-click fetching for Revolut, Trade Republic and Bankinter/ING (open banking via Enable Banking), imported with your saved mapping
 - **Category Management** - Custom categories with icons and colors
 - **Reports & Charts** - Visual spending analysis, monthly trends, savings rate
 - **Multi-Currency Accounts** - Keep each account in its native currency while still seeing unified totals
+- **Investments** - Holdings, operations, market prices (Stooq/Yahoo) and evolution-tracked assets (Mintos, fixed income)
 
 ### Currency & Exchange Rates
 - **Account Currency Display** - Transaction rows and account-level values are shown in each account's own currency
 - **Base Currency Conversion** - Dashboard, budget, and report aggregates are converted into your selected base currency
-- **ECB Daily Sync** - Exchange rates can be synced from the European Central Bank (ECB)
+- **ECB Daily Sync** - Exchange rates are synced once a day from the European Central Bank (ECB)
 - **Manual Rate Overrides** - Edit or insert custom FX rates from the UI when needed
 
 ### Smart Categorization
-- **Auto-Categorization Rules** - Create patterns to automatically categorize transactions
+- **Auto-Categorization Rules** - Plain-text or regex patterns, matched on description + payee or payee only
 - **Keyboard-Driven Clearing** - Quickly categorize transactions using keyboard shortcuts
-- **Category Suggestions** - Smart suggestions based on merchant/payee
-
-### Email Inbox (Forward Receipts)
-- **Unique Email Address** - Each user gets an email like `abc123@in.financetracker.app`
-- **Auto-Parsing** - Extracts vendor, amount, date from forwarded invoices
-- **50+ Vendors Supported** - Airlines, hotels, subscriptions, food delivery, etc.
-- **Review & Approve** - Review parsed data before creating transactions
-
-### SaaS Features (Cloud Version)
-- **Multi-Tenant Architecture** - Isolated container per customer
-- **Stripe Integration** - European payments with SEPA Direct Debit support
-- **Custom Subdomains** - Each customer gets `company.financetracker.app`
-- **Admin Dashboard** - Manage tenants, view stats, billing
+- **Re-import safe** - Re-importing a statement refreshes bank data but keeps the categories you set
 
 ## Quick Start
 
-### Self-Hosted (Local Development)
+### Local
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/financetracker.git
-cd financetracker
-
-# Create virtual environment
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
-# Run the application
-python app.py
-
-# Open http://localhost:8000 in your browser
+python app.py                   # http://localhost:8000
 ```
 
-### Docker (Self-Hosted)
+The first account you register becomes the only one: registration closes after that unless you set `REGISTRATION_ENABLED=true`.
+
+### Docker
 
 ```bash
-# Build and run with Docker Compose
-docker-compose up -d
-
-# Open http://localhost:5000
+docker compose up -d            # http://localhost:8000
 ```
 
-### SaaS Mode (Landing Page + Multi-Tenant)
-
-```bash
-# Set environment variables
-export SAAS_MODE=true
-export STRIPE_SECRET_KEY=sk_live_...
-
-# Run the application
-python app.py
-
-# Open http://localhost:8000 to see landing page
-```
+The database, the generated secret key and the bank-statement drop folders live on the `finance_data` volume (`/data`).
 
 ## Configuration
 
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
-
-### Environment Variables
+Everything is optional. Copy `.env.example` to `.env` (it is loaded automatically) or set environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SECRET_KEY` | Flask secret key | `dev-secret-key...` |
+| `SECRET_KEY` | Session signing key | generated once and stored in `instance/secret_key` |
+| `SECRET_KEY_FILE` | Where the generated key is stored | `instance/secret_key` |
 | `DATABASE` | SQLite database path | `finance.db` |
-| `REGISTRATION_ENABLED` | Enable/disable new user registration | `true` |
-| `SAAS_MODE` | Enable SaaS features | `false` |
-| `SAAS_DOMAIN` | Domain for tenant subdomains | `financetracker.app` |
-| `EMAIL_DOMAIN` | Domain for email ingestion | `in.financetracker.app` |
-| `STRIPE_SECRET_KEY` | Stripe API secret key | - |
-| `STRIPE_PUBLISHABLE_KEY` | Stripe publishable key | - |
+| `DATA_DIR` | Folder holding `raw/<bank>/` statement drop folders | `data` |
+| `REGISTRATION_ENABLED` | Keep registration open after the first user | `false` |
+| `FLASK_DEBUG` | `1` enables the Flask debugger for `python app.py` | off |
 
 ## Project Structure
 
 ```
 financetracker/
-├── app.py                 # Main Flask application
-├── saas.py                # SaaS management module
-├── email_processor.py     # Email parsing for receipts
-├── provision.py           # Docker tenant provisioning
-├── requirements.txt       # Python dependencies
-├── Dockerfile             # Container image
-├── docker-compose.yml     # Self-hosted deployment
-├── docker-compose.saas.yml # SaaS infrastructure
-├── templates/
-│   ├── base.html          # Base template
-│   ├── landing.html       # SaaS landing page
-│   ├── dashboard.html     # Main dashboard
-│   ├── transactions.html  # Transaction list
-│   ├── accounts.html      # Account management
-│   ├── categories.html    # Category management
-│   ├── rules.html         # Auto-categorization rules
-│   ├── clear.html         # Keyboard-driven clearing
-│   ├── email_inbox.html   # Email receipt inbox
-│   ├── reports.html       # Reports & charts
-│   ├── import.html        # CSV import
-│   └── ...
-└── static/
-    ├── css/
-    └── js/
+├── app.py                 # The whole Flask application (routes, schema, migrations, importers)
+├── sync_connectors.py     # Fetchers behind the Sync page (Revolut, Trade Republic, Enable Banking)
+├── requirements.txt       # Runtime dependencies
+├── requirements-dev.txt   # + pytest, ruff
+├── tests/                 # pytest suite (synthetic fixtures only)
+├── Dockerfile
+├── docker-compose.yml
+├── data/raw/<bank>/       # Drop folders for bank statements (gitignored)
+├── templates/             # Jinja templates (Bootstrap 5, Chart.js)
+└── desktop/               # Separate Tauri desktop app
 ```
 
 ## Usage Guide
 
 ### Importing Bank Transactions
 
-1. Export CSV from your bank
-2. Go to **Import** in the sidebar
-3. Select the account to import into
-4. Upload your CSV file
-5. The importer auto-detects:
-   - Expected columns: `ID_TRANSACTION,DATE,AMOUNT,CATEGORY,DESCRIPTION`
-   - Date format (YYYY-MM-DD)
-   - Number format (1,234.56 or 1.234,56)
-   - Delimiter (comma, semicolon, tab)
-   - If `ID_TRANSACTION` is present and already imported, the new row replaces the previous transaction data
+- **Bank statements**: drop the export into `data/raw/<bank>/` (or upload it from **Import → Bank**), map currencies to accounts, preview and confirm.
+- **Sync**: after one manual import per source, the **Sync** page fetches new data and imports it with the same settings (setup in [`INSTALL.md`](INSTALL.md#sync-connectors-sync)).
+- **Generic CSV** (**Import**): columns `ID_TRANSACTION, DATE, AMOUNT, CATEGORY, DESCRIPTION`; with a header row you may also add `PAYEE` and `TRANSACTION_TYPE`, in any order.
+  - Dates `YYYY-MM-DD` or `DD/MM/YYYY`; amounts `1,234.56` or `1.234,56`; comma, semicolon or tab delimited; UTF-8 or Windows-1252.
+  - Rows are matched by `ID_TRANSACTION` (or by their content when there is none), so re-importing a file updates rather than duplicates.
 
-### Exporting and Restoring Data
+### Backups
 
-You can now export and reimport the main finance datasets:
-
-- **Transactions** (including per-account data)
-- **Categories**
-- **Rules**
-- **Full backup** as:
-   - ZIP package with multiple CSV files
-   - Excel workbook (`.xlsx`) with multiple sheets
-
-Web app flow:
-1. Go to **Import** in the sidebar (now also contains export and restore actions).
-2. Use quick export buttons for individual CSV datasets or full ZIP/XLSX backup.
-3. Use restore actions to import categories, rules, or a full ZIP/XLSX package.
-
-Merge behavior:
-- Default restore mode is **merge/upsert**.
-- Transactions use `ID_TRANSACTION` when available.
-- If `ID_TRANSACTION` is missing, the importer generates a deterministic fallback ID so repeated imports stay idempotent.
-
-### Setting Up Email Forwarding
-
-1. Go to **Email** in the sidebar
-2. Copy your unique email address
-3. Set up email forwarding in Gmail/Outlook:
-   - **Gmail**: Settings → Forwarding → Add address
-   - **Outlook**: Settings → Mail → Forwarding
-4. Or simply forward invoices manually to your inbox email
+- **Complete backup**: **Options → Download database backup** saves the whole SQLite database (investments, budgets, settings). Restore it by stopping the app and replacing `finance.db`.
+- **Spreadsheet export**: **Import** page → ZIP (CSV files) or Excel with accounts, categories, rules and transactions. These can be restored with **Restore Full Backup** (merge/upsert).
 
 ### Keyboard Shortcuts (Clearing Page)
 
@@ -190,141 +105,52 @@ Merge behavior:
 | `r` | Create rule |
 | `s` | Skip |
 
-### Auto-Categorization Rules
-
-1. Go to **Rules** in the sidebar
-2. Click **Add Rule**
-3. Enter a pattern (e.g., `UBER`, `Amazon`, `NETFLIX`)
-4. Select the category
-5. Rules are applied during import and email processing
-
-### Managing Currencies (Web App)
+### Managing Currencies
 
 1. Go to **Options** in the sidebar.
 2. Select your **Base Currency for Aggregates** and save.
-3. Click **Sync ECB Rates Now** to refresh rates.
+3. Rates sync from the ECB automatically once a day; **Sync ECB Rates Now** forces a refresh.
 4. Use **Add / Override Rate Manually** to create or update a rate pair.
-5. Optionally edit an existing rate inline in the rates table.
 
-Behavior notes:
-- Dashboard cards, reports, and budget totals are converted to your selected base currency.
-- Transaction and clearing rows keep account-native currency values.
-- If a conversion rate is missing, the app falls back to the original amount to avoid blocking the UI.
+If a rate is missing, amounts in that currency are shown unconverted and a warning names the missing pair.
 
-## API Endpoints
-
-### Email Webhook
-```
-POST /api/email/inbound
-```
-Receives forwarded emails from SendGrid, Mailgun, or Postmark.
-
-### Transaction API
-```
-POST /api/transaction/<id>/categorize
-POST /api/auto-categorize
-```
-
-### Currency Options API (Session Auth)
-```
-GET /options
-POST /options/base-currency
-POST /options/sync-rates
-POST /options/rates/update
-```
-These endpoints power the web Options page for base currency and exchange-rate management.
-
-## Deployment
-
-### Docker Compose (Self-Hosted)
+## Development
 
 ```bash
-docker-compose up -d
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### SaaS with Traefik
-
-```bash
-# Configure environment
-cp .env.example .env
-# Edit .env with your Stripe keys and domain
-
-# Start infrastructure
-docker-compose -f docker-compose.saas.yml up -d
-```
-
-### Provisioning Tenants
-
-```bash
-# List all tenants
-python provision.py list
-
-# Provision a tenant container
-python provision.py provision <tenant_id>
-
-# Provision all pending
-python provision.py provision-all
-```
-
-## Pricing Plans (SaaS)
-
-| Plan | Price | Features |
-|------|-------|----------|
-| **Self-Hosted** | Free | Full source code, Docker ready |
-| **Cloud Pro** | €9/month | Own subdomain, backups, SSL, EU data |
-| **Cloud Family** | €19/month | Pro + 5 users, custom domain |
+Schema changes go in the `MIGRATIONS` list in `app.py` (tracked with `PRAGMA user_version`).
 
 ## Desktop App (Tauri)
 
 FinanceTracker also ships as a **native desktop application** for Windows, macOS, and Linux. The desktop version:
 
-- Works **100% offline** — no server or internet needed
+- Works offline (it only goes online to fetch the daily ECB rates)
 - Uses a local SQLite file you choose (no login/password)
 - Supports **English**, **Portuguese (BR)**, and **Spanish**
 - Includes a **bundled demo database** so you can try it instantly
-- Includes **Options** for base currency, daily ECB sync, and manual exchange-rate edits
 
 See [`desktop/README.md`](desktop/README.md) for build instructions.
 
-## Server Installation
+## Security Notes
 
-For detailed server deployment instructions (Docker, VPS, SaaS mode), see [`INSTALL.md`](INSTALL.md).
+The web app is designed for a single user on `localhost`. It has a CSRF origin check, a generated secret key and closed registration, but it does **not** isolate multiple users from each other (shared import folders, global exchange rates). Put it behind a TLS reverse proxy and review [`INSTALL.md`](INSTALL.md) before exposing it to a network.
 
 ## Tech Stack
 
 ### Web Version
-- **Backend**: Python 3.9+, Flask 3.0+
+- **Backend**: Python 3.11+, Flask 3.1+
 - **Database**: SQLite
 - **Frontend**: Bootstrap 5, Chart.js
-- **Payments**: Stripe (with SEPA support)
-- **Email**: SendGrid / Mailgun / Postmark
-- **Deployment**: Docker, Traefik
 
 ### Desktop Version
 - **Shell**: Tauri v2 (Rust)
 - **Backend**: Rust + rusqlite (bundled SQLite)
 - **Frontend**: React 18, Vite, Bootstrap 5, Chart.js
 - **i18n**: react-i18next (EN, PT-BR, ES)
-- **Platforms**: Windows (.msi), macOS (.dmg), Linux (.AppImage, .deb)
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-- **Documentation**: [docs.financetracker.app](https://docs.financetracker.app)
-- **Issues**: [GitHub Issues](https://github.com/yourusername/financetracker/issues)
-- **Email**: support@financetracker.app
-
----
-
-Made with ❤️ in Europe

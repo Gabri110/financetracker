@@ -10,12 +10,10 @@ import {
   setBaseCurrency,
 } from "../api/tauri";
 import Alert from "../components/Alert";
+import { fmt } from "../format";
 
 const ACCOUNT_TYPES = ["checking", "savings", "credit", "cash", "investment", "other"];
 const CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "SEK", "NOK", "DKK"];
-
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 
 const empty = { name: "", account_type: "checking", balance: 0, currency: "USD" };
 const emptyAdjustment = { enabled: false, targetBalance: "" };
