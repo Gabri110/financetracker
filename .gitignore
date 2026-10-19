@@ -12,6 +12,13 @@ finance.db
 !**/iberia_cards/.gitkeep
 **/mintos/*
 !**/mintos/.gitkeep
+**/myinvestor/*
+!**/myinvestor/.gitkeep
+**/bankinter/*
+!**/bankinter/.gitkeep
+**/ing/*
+!**/ing/.gitkeep
+*.pem
 .DS_Store
 .claude/
 

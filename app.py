@@ -7,17 +7,20 @@ import sqlite3
 import hashlib
 import zipfile
 import importlib
+import pathlib
 from decimal import Decimal, InvalidOperation
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from urllib.error import HTTPError
 from urllib import request as urllib_request
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
 from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file
-from flask import has_app_context
+from flask import has_app_context, session
+import sync_connectors
+from sync_connectors import SyncError
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -53,7 +56,8 @@ BANK_IMPORT_SOURCES = {
         'investments': False,
         # The Iberia Cards bill is debited from Revolut EUR; without this the
         # charges (imported from the statements) would be double-counted.
-        'default_transfer_patterns': ['Iberia Cards'],
+        # MyInvestor movements are all internal transfers (see parse_myinvestor_csv).
+        'default_transfer_patterns': ['Iberia Cards', 'MyInvestor'],
     },
     'trade_republic': {
         'label': 'Trade Republic',
@@ -61,13 +65,6 @@ BANK_IMPORT_SOURCES = {
         'extensions': ('.csv',),
         'multi_currency': False,
         'investments': True,
-    },
-    'b100': {
-        'label': 'B100',
-        'folder': os.path.join('data', 'raw', 'B100'),
-        'extensions': ('.csv',),
-        'multi_currency': False,
-        'investments': False,
     },
     'edenred_restaurant': {
         'label': 'Edenred Restaurante',
@@ -88,12 +85,51 @@ BANK_IMPORT_SOURCES = {
         'investments': False,
         'default_category': 'Transporte',
     },
+    # Open banking (Enable Banking, see sync_connectors.py): the Sync page
+    # fetches transactions into data/raw/<source>/. Rows are mapped to app
+    # accounts per bank account (IBAN) through the multi-currency mapping.
+    'bankinter': {
+        'label': 'Bankinter',
+        'folder': os.path.join('data', 'raw', 'bankinter'),
+        'extensions': ('.csv',),
+        'multi_currency': True,
+        'investments': False,
+        'open_banking': {'aspsp': 'Bankinter', 'country': 'ES', 'id_prefix': 'bki'},
+    },
+    'ing': {
+        'label': 'ING',
+        'folder': os.path.join('data', 'raw', 'ing'),
+        'extensions': ('.csv',),
+        'multi_currency': True,
+        'investments': False,
+        'open_banking': {'aspsp': 'ING', 'country': 'ES', 'id_prefix': 'ing'},
+    },
+    # Archived: no longer used, but their historic exports (some can't be
+    # downloaded again) stay importable, e.g. after rebuilding the database.
+    # Hidden from the Sync page.
+    'b100': {
+        'label': 'B100',
+        'folder': os.path.join('data', 'raw', 'B100'),
+        'extensions': ('.csv',),
+        'multi_currency': False,
+        'investments': False,
+        'archived': True,
+    },
     'iberia_cards': {
         'label': 'Iberia Cards',
         'folder': os.path.join('data', 'raw', 'iberia_cards'),
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
+        'archived': True,
+    },
+    'myinvestor': {
+        'label': 'MyInvestor',
+        'folder': os.path.join('data', 'raw', 'myinvestor'),
+        'extensions': ('.csv',),
+        'multi_currency': False,
+        'investments': False,
+        'archived': True,
     },
 }
 TRADE_REPUBLIC_INCOME_TYPES = {
@@ -3586,6 +3622,102 @@ def parse_b100_csv(csv_text):
     return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
 
 
+def parse_myinvestor_csv(csv_text):
+    """Parse a MyInvestor 'Movimientos Mi Cuenta' export. Columns (';'-delimited,
+    decimal comma): Fecha de operación, Fecha de valor, Concepto, Importe, Divisa."""
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=';')
+    rows = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+
+    for row in reader:
+        fecha_valor = (row.get('Fecha de valor') or '').strip()
+        try:
+            date = parse_import_date((row.get('Fecha de operación') or '').strip())
+        except ValueError:
+            skipped['NO_DATE'] += 1
+            continue
+        raw_amount = (row.get('Importe') or '').strip()
+        try:
+            amount = Decimal(raw_amount.replace('.', '').replace(',', '.') or '0').quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        concepto = (row.get('Concepto') or '').strip()
+        if not concepto and amount == 0:
+            skipped['EMPTY'] += 1
+            continue
+
+        key = (date, fecha_valor, concepto, str(amount))
+        occurrences[key] += 1
+
+        rows.append({
+            'id_transaction': synthetic_bank_id('myi', *key, occurrences[key]),
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            # The account only moved money between the user's own accounts, so
+            # every row (interest and Plan Amigo included) is kept out of
+            # income/expense reports by user decision.
+            'transaction_type': 'transfer',
+            'currency': normalize_currency(row.get('Divisa')),
+            'category_text': '',
+            'description': concepto,
+            'payee': '',
+        })
+
+    return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
+def parse_open_banking_csv(csv_text, id_prefix):
+    """Parse a CSV written by the Sync page from Enable Banking data
+    (sync_connectors.OPEN_BANKING_CSV_FIELDS). One file may hold several bank
+    accounts: 'account_key' (the IBAN) picks the app account per row."""
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    skipped = defaultdict(int)
+    occurrences = defaultdict(int)
+
+    for row in reader:
+        date = parse_bank_export_date(row.get('booking_date'))
+        if not date:
+            skipped['NO_DATE'] += 1
+            continue
+        try:
+            amount = Decimal((row.get('amount') or '').strip() or '0').quantize(Decimal('0.01'))
+        except InvalidOperation:
+            skipped['BAD_AMOUNT'] += 1
+            continue
+
+        account_key = (row.get('account_key') or '').strip().upper()
+        description = (row.get('description') or '').strip()
+        payee = (row.get('payee') or '').strip()
+        bank_id = (row.get('id') or '').strip()
+        if bank_id:
+            id_transaction = f'{id_prefix}_{bank_id}'
+        else:
+            # Some Redsys banks send no entry reference: hash the content.
+            key = (account_key, date, str(amount), description, payee)
+            occurrences[key] += 1
+            id_transaction = synthetic_bank_id(id_prefix, *key, occurrences[key])
+
+        rows.append({
+            'id_transaction': id_transaction,
+            'legacy_id': None,
+            'date': date,
+            'amount': amount,
+            'transaction_type': 'income' if amount >= 0 else 'expense',
+            'currency': normalize_currency(row.get('currency')),
+            'mapping_key': account_key,
+            'category_text': '',
+            'description': description,
+            'payee': payee,
+        })
+
+    return {'rows': rows, 'investment_rows': [], 'skipped': dict(skipped)}
+
+
 def load_xlsx_worksheet(path):
     try:
         openpyxl = importlib.import_module('openpyxl')
@@ -4149,6 +4281,9 @@ BANK_IMPORT_PARSERS = {
     'edenred_restaurant': lambda path: parse_edenred_xlsx(path, 'restaurant'),
     'edenred_mobility': lambda path: parse_edenred_xlsx(path, 'movilidad'),
     'iberia_cards': parse_iberia_cards_xlsx,
+    'myinvestor': parse_myinvestor_csv,
+    'bankinter': lambda csv_text: parse_open_banking_csv(csv_text, 'bki'),
+    'ing': lambda csv_text: parse_open_banking_csv(csv_text, 'ing'),
 }
 
 
@@ -4239,9 +4374,12 @@ def build_bank_import_plan(db, user_id, source, settings):
             if any(pattern in row_text for pattern in transfer_patterns):
                 row = {**row, 'transaction_type': 'transfer'}
                 pattern_forced = True
-        currency = row['currency']
+        # Rows map to accounts by currency, or by bank account (IBAN) for
+        # open-banking sources; 'currency' in the stats is that mapping key.
+        currency = row.get('mapping_key') or row['currency']
         stats = currency_stats.setdefault(currency, {
             'currency': currency,
+            'amount_currency': row['currency'],
             'count': 0,
             'kept': 0,
             'income': Decimal('0'),
@@ -4265,7 +4403,7 @@ def build_bank_import_plan(db, user_id, source, settings):
         if account:
             stats['account_id'] = account['id']
             stats['account_name'] = account['name']
-            stats['currency_mismatch'] = normalize_currency(account['currency']) != currency
+            stats['currency_mismatch'] = normalize_currency(account['currency']) != row['currency']
         stats['enabled'] = enabled
 
         if not account or not enabled:
@@ -4686,6 +4824,8 @@ def build_bank_import_context(db, user_id):
             'extensions': config['extensions'],
             'multi_currency': config['multi_currency'],
             'investments': config['investments'],
+            'archived': config.get('archived', False),
+            'open_banking': bool(config.get('open_banking')),
             'files': list_bank_import_files(source),
             'currencies': [],
             'error': None,
@@ -4695,7 +4835,7 @@ def build_bank_import_context(db, user_id):
             data = load_bank_source_rows(source)
             counts = defaultdict(int)
             for row in data['rows']:
-                counts[row['currency']] += 1
+                counts[row.get('mapping_key') or row['currency']] += 1
             entry['currencies'] = [
                 {'currency': currency, 'count': counts[currency]}
                 for currency in sorted(counts, key=lambda cur: -counts[cur])
@@ -4793,44 +4933,70 @@ def bank_import_confirm():
     try:
         # Re-build from the files on disk: cookie sessions cannot carry the rows
         # and re-parsing ~2k rows is effectively free.
-        plan = build_bank_import_plan(db, current_user.id, source, settings)
+        result = run_bank_import(db, current_user.id, source, settings)
     except ValueError as exc:
         flash(str(exc), 'danger')
         return redirect(url_for('bank_import'))
 
-    imported, updated, migrated, errors = upsert_bank_transactions(db, current_user.id, plan['rows'])
+    flash_bank_import_result(source, result)
+    return redirect(url_for('transactions'))
+
+
+def run_bank_import(db, user_id, source, settings):
+    """Import every file of a source with validated settings, save the settings
+    and commit. Shared by the confirm step and the Sync page. Raises ValueError
+    when the source files can't be read."""
+    plan = build_bank_import_plan(db, user_id, source, settings)
+    imported, updated, migrated, errors = upsert_bank_transactions(db, user_id, plan['rows'])
 
     ops_created = ops_skipped = holdings_created = 0
     if plan['investment_plan']:
         ops_created, ops_skipped, holdings_created = import_tr_investment_ops(
-            db, current_user.id, plan['investment_plan']['account_id'], plan['investment_plan']['rows']
+            db, user_id, plan['investment_plan']['account_id'], plan['investment_plan']['rows']
         )
 
-    set_user_setting(db, current_user.id, f'bank_import.{source}', settings)
+    set_user_setting(db, user_id, f'bank_import.{source}', settings)
     db.commit()
+    return {
+        'imported': imported,
+        'updated': updated,
+        'migrated': migrated,
+        'errors': errors,
+        'has_investments': bool(plan['investment_plan']),
+        'ops_created': ops_created,
+        'ops_skipped': ops_skipped,
+        'holdings_created': holdings_created,
+    }
 
+
+def bank_import_result_messages(source, result):
+    """(message, category) pairs summarising a run_bank_import result."""
     label = BANK_IMPORT_SOURCES[source]['label']
-    flash(
-        f'{label}: imported {imported} new, updated {updated} existing'
-        + (f', migrated {migrated} legacy' if migrated else '')
+    messages = [(
+        f"{label}: imported {result['imported']} new, updated {result['updated']} existing"
+        + (f", migrated {result['migrated']} legacy" if result['migrated'] else '')
         + ' transactions.',
         'success',
-    )
-    if plan['investment_plan']:
-        flash(
-            f'Investments: created {ops_created} operations'
-            + (f' and {holdings_created} holdings' if holdings_created else '')
-            + (f', skipped {ops_skipped} already imported' if ops_skipped else '')
+    )]
+    if result['has_investments']:
+        messages.append((
+            f"Investments: created {result['ops_created']} operations"
+            + (f" and {result['holdings_created']} holdings" if result['holdings_created'] else '')
+            + (f", skipped {result['ops_skipped']} already imported" if result['ops_skipped'] else '')
             + '.',
-            'success' if ops_created or not ops_skipped else 'info',
-        )
+            'success' if result['ops_created'] or not result['ops_skipped'] else 'info',
+        ))
+    errors = result['errors']
     if errors and len(errors) <= 5:
-        for error_message in errors:
-            flash(error_message, 'danger')
+        messages.extend((error_message, 'danger') for error_message in errors)
     elif errors:
-        flash(f'There were {len(errors)} errors during import.', 'danger')
+        messages.append((f'There were {len(errors)} errors during import.', 'danger'))
+    return messages
 
-    return redirect(url_for('transactions'))
+
+def flash_bank_import_result(source, result):
+    for message, category in bank_import_result_messages(source, result):
+        flash(message, category)
 
 
 def build_mintos_import_context(db, user_id):
@@ -4935,11 +5101,24 @@ def mintos_import_confirm():
         flash('Invalid import settings.', 'danger')
         return redirect(url_for('mintos_import'))
 
-    account_id = settings.get('account_id')
-    valid_account_ids = {acc['id'] for acc in get_investment_accounts(db, current_user.id)}
-    if account_id not in valid_account_ids:
-        flash('Invalid investment account selected.', 'danger')
+    try:
+        message = run_mintos_import(db, current_user.id, settings)
+    except ValueError as exc:
+        flash(str(exc), 'danger')
         return redirect(url_for('mintos_import'))
+
+    flash(message, 'success')
+    return redirect(url_for('investments'))
+
+
+def run_mintos_import(db, user_id, settings):
+    """Import the Mintos statements with confirmed/saved settings and commit.
+    Shared by the confirm step and the Sync page. Returns a summary message;
+    raises ValueError with a user-facing message."""
+    account_id = settings.get('account_id')
+    valid_account_ids = {acc['id'] for acc in get_investment_accounts(db, user_id)}
+    if account_id not in valid_account_ids:
+        raise ValueError('Invalid investment account selected.')
 
     holding = None
     holding_id = settings.get('holding_id')
@@ -4947,38 +5126,499 @@ def mintos_import_confirm():
         holding = db.execute(
             '''SELECT * FROM investment_holdings
                WHERE id = ? AND user_id = ? AND account_id = ? AND asset_class = 'Mintos Lending' ''',
-            (holding_id, current_user.id, account_id),
+            (holding_id, user_id, account_id),
         ).fetchone()
     if not holding:
         holding = find_or_create_mintos_holding(
-            db, current_user.id, account_id, create_if_missing=bool(settings.get('create_holding'))
+            db, user_id, account_id, create_if_missing=bool(settings.get('create_holding'))
         )
     if not holding:
-        flash('No Mintos Lending holding in that account. Enable "create holding" or pick one.', 'danger')
-        return redirect(url_for('mintos_import'))
+        raise ValueError('No Mintos Lending holding in that account. Enable "create holding" or pick one.')
 
-    try:
-        plan = build_mintos_import_plan(
-            db, current_user.id, account_id, holding['id'], bool(settings.get('create_holding'))
-        )
-    except ValueError as exc:
-        flash(str(exc), 'danger')
-        return redirect(url_for('mintos_import'))
-
-    result = import_mintos_statement(db, current_user.id, holding, plan)
-    set_user_setting(db, current_user.id, 'mintos_import', {
+    plan = build_mintos_import_plan(
+        db, user_id, account_id, holding['id'], bool(settings.get('create_holding'))
+    )
+    result = import_mintos_statement(db, user_id, holding, plan)
+    set_user_setting(db, user_id, 'mintos_import', {
         'account_id': account_id,
         'holding_id': holding['id'],
         'create_holding': bool(settings.get('create_holding')),
     })
     db.commit()
-
-    flash(
+    return (
         f"Mintos: added {result['deposits_created']} deposit(s); "
-        f"value {result['valuation_action']} at {format_currency(plan['current_total_value'], plan['currency'])}.",
+        f"value {result['valuation_action']} at {format_currency(plan['current_total_value'], plan['currency'])}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync page: one-click fetching per source (connectors in sync_connectors.py).
+# Each connector writes a CSV into data/raw/<source>/ in the format the
+# source's parser reads, then the normal bank import runs with the settings
+# saved by the last manual import (so the first import of a source is always
+# done on /import/bank, where the accounts are mapped).
+# ---------------------------------------------------------------------------
+
+SYNC_FETCH_OVERLAP_DAYS = 31
+# Trade Republic: refuse to auto-import when pytr ids don't match the ids
+# already imported from the official CSV export for the overlapping period.
+TR_MIN_ID_MATCH_RATE = 0.8
+
+
+def latest_imported_date(db, user_id, id_prefix):
+    row = db.execute(
+        r'''SELECT MAX(date) AS last_date FROM transactions
+            WHERE user_id = ? AND id_transaction LIKE ? ESCAPE '\' ''',
+        (user_id, id_prefix.replace('_', r'\_') + r'\_%'),
+    ).fetchone()
+    return datetime.strptime(row['last_date'][:10], '%Y-%m-%d').date() if row and row['last_date'] else None
+
+
+def sync_fetch_start(db, user_id, id_prefix, default_days):
+    """First date to fetch: a month before the newest imported row, so late
+    bookings are picked up; `default_days` back when nothing is imported yet."""
+    last_date = latest_imported_date(db, user_id, id_prefix)
+    if last_date:
+        return last_date - timedelta(days=SYNC_FETCH_OVERLAP_DAYS)
+    return datetime.now().date() - timedelta(days=default_days)
+
+
+def save_sync_file(source, csv_text, suffix):
+    folder = BANK_IMPORT_SOURCES[source]['folder']
+    os.makedirs(folder, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y_%m_%d_%H%M%S')}_{suffix}.csv"
+    with open(os.path.join(folder, filename), 'w', encoding='utf-8', newline='') as handle:
+        handle.write(csv_text)
+    return filename
+
+
+def import_synced_source(db, user_id, source, filename, extra=None):
+    """Run the bank import for a freshly synced source with its saved settings.
+    Returns [(message, category)] and records the run under sync.<source>."""
+    label = BANK_IMPORT_SOURCES[source]['label']
+    status = {'ran_at': datetime.now().isoformat(timespec='seconds'), 'file': filename, **(extra or {})}
+    settings = get_user_setting(db, user_id, f'bank_import.{source}', None)
+    error = validate_bank_import_settings(db, user_id, source, settings) if settings else 'not set up'
+    if error:
+        status['result'] = 'needs_setup'
+        set_user_setting(db, user_id, f'sync.{source}', status)
+        db.commit()
+        return [(
+            f'{label}: fetched {filename}. Map its accounts once on Bank Import and confirm; '
+            'later syncs import automatically.',
+            'warning',
+        )]
+    try:
+        result = run_bank_import(db, user_id, source, settings)
+    except ValueError as exc:
+        return [(f'{label}: {exc}', 'danger')]
+    status.update({'result': 'imported', 'imported': result['imported'], 'updated': result['updated']})
+    set_user_setting(db, user_id, f'sync.{source}', status)
+    db.commit()
+    return bank_import_result_messages(source, result)
+
+
+def sync_revolut(db, user_id, curl_text):
+    revolut_session = sync_connectors.parse_revolut_curl(curl_text)
+    since = sync_fetch_start(db, user_id, 'rev', 730)
+    transactions = sync_connectors.fetch_revolut_transactions(revolut_session, since)
+    custom_categories = get_user_setting(db, user_id, 'revolut.custom_categories', {}) or {}
+    csv_text, unknown = sync_connectors.revolut_transactions_to_csv(transactions, custom_categories)
+    filename = save_sync_file('revolut', csv_text, 'sync')
+    messages = import_synced_source(db, user_id, 'revolut', filename, {'fetched': len(transactions)})
+    if unknown:
+        messages.append((
+            f"Revolut: {len(unknown)} custom categor{'y' if len(unknown) == 1 else 'ies'} without a name "
+            f"(imported uncategorised): {', '.join(unknown)}. Name them under Revolut custom categories.",
+            'warning',
+        ))
+    return messages
+
+
+def check_trade_republic_ids(db, user_id, csv_text):
+    """Error message when pytr ids don't line up with already imported TR
+    rows in the overlapping period (would create duplicates), else None."""
+    settings = get_user_setting(db, user_id, 'bank_import.trade_republic', {}) or {}
+    from_date = settings.get('from_date') or ''
+    last_date = latest_imported_date(db, user_id, 'tr')
+    if not last_date:
+        return None
+    overlap_ids = [
+        row['id_transaction'] for row in parse_trade_republic_csv(csv_text)['rows']
+        if row['date'] <= last_date.isoformat() and row['date'] >= from_date
+    ]
+    if len(overlap_ids) < 5:
+        return None
+    placeholders = ','.join('?' for _ in overlap_ids)
+    matched = db.execute(
+        f'SELECT COUNT(DISTINCT id_transaction) FROM transactions WHERE user_id = ? AND id_transaction IN ({placeholders})',
+        (user_id, *overlap_ids),
+    ).fetchone()[0]
+    if matched / len(overlap_ids) >= TR_MIN_ID_MATCH_RATE:
+        return None
+    return (
+        f'Trade Republic: only {matched} of {len(overlap_ids)} fetched rows up to {last_date} match '
+        'already imported ids, so importing would duplicate them. Nothing imported. On Bank Import, set '
+        f'Trade Republic "Only import from date" to {last_date + timedelta(days=1)} and sync again.'
+    )
+
+
+def sync_trade_republic(db, user_id):
+    since = sync_fetch_start(db, user_id, 'tr', 3650)
+    folder = BANK_IMPORT_SOURCES['trade_republic']['folder']
+    cache_dir = pathlib.Path(folder) / 'pytr_cache'
+    events = sync_connectors.fetch_trade_republic_events(since, cache_dir)
+    csv_text, skipped = sync_connectors.trade_republic_events_to_csv(events)
+    guard_error = check_trade_republic_ids(db, user_id, csv_text)
+    if guard_error:
+        # Kept outside the scanned folder for inspection.
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"{datetime.now().strftime('%Y_%m_%d_%H%M%S')}_unverified.csv").write_text(csv_text, encoding='utf-8')
+        return [(guard_error, 'danger')]
+    filename = save_sync_file('trade_republic', csv_text, 'pytr')
+    messages = import_synced_source(db, user_id, 'trade_republic', filename, {'fetched': len(events)})
+    if skipped:
+        details = ', '.join(f'{count} {reason}' for reason, count in sorted(skipped.items()))
+        messages.append((f'Trade Republic: skipped events: {details}.', 'info'))
+    return messages
+
+
+def enable_banking_client():
+    return sync_connectors.EnableBankingClient(
+        os.environ.get('ENABLE_BANKING_APP_ID', ''),
+        os.environ.get('ENABLE_BANKING_KEY_PATH', ''),
+    )
+
+
+def enable_banking_redirect_url():
+    return os.environ.get('ENABLE_BANKING_REDIRECT_URL') or url_for('sync_callback', _external=True)
+
+
+def sync_open_banking(db, user_id, source):
+    config = BANK_IMPORT_SOURCES[source]
+    label = config['label']
+    consent = get_user_setting(db, user_id, f'enable_banking.{source}', None)
+    if not consent or not consent.get('accounts'):
+        return [(f'{label}: connect the bank first.', 'warning')]
+    client = enable_banking_client()
+    since = sync_fetch_start(db, user_id, config['open_banking']['id_prefix'], 730)
+    rows = []
+    balances = []
+    for account in consent['accounts']:
+        try:
+            transactions = client.fetch_transactions(account['uid'], since)
+        except SyncError as exc:
+            if exc.action == 'reconnect' or latest_imported_date(db, user_id, config['open_banking']['id_prefix']):
+                raise
+            # First fetch: many banks only serve ~90 days without a fresh SCA.
+            transactions = client.fetch_transactions(account['uid'], datetime.now().date() - timedelta(days=89))
+        rows.extend(sync_connectors.open_banking_transactions_to_rows(account, transactions))
+        balance = client.fetch_balance(account['uid'])
+        balances.append({
+            'account_key': account['iban'] or account['uid'],
+            'amount': balance.get('amount'),
+            'currency': balance.get('currency') or account['currency'],
+        })
+    csv_text = sync_connectors.rows_to_csv_text(sync_connectors.OPEN_BANKING_CSV_FIELDS, rows)
+    filename = save_sync_file(source, csv_text, 'api')
+    return import_synced_source(db, user_id, source, filename, {'fetched': len(rows), 'balances': balances})
+
+
+def consent_days_left(consent):
+    try:
+        valid_until = datetime.fromisoformat(str(consent.get('valid_until')).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if valid_until.tzinfo:
+        valid_until = valid_until.astimezone().replace(tzinfo=None)
+    return (valid_until - datetime.now()).days
+
+
+SYNC_ID_PREFIXES = {
+    'revolut': 'rev',
+    'trade_republic': 'tr',
+    'edenred_restaurant': 'edr',
+    'edenred_mobility': 'edr',
+}
+
+
+def build_sync_context(db, user_id):
+    sources = []
+    upload_by_folder = {}
+    for source, config in BANK_IMPORT_SOURCES.items():
+        if config.get('archived'):
+            continue
+        if source in ('revolut', 'trade_republic'):
+            kind = source
+        elif config.get('open_banking'):
+            kind = 'open_banking'
+        else:
+            kind = 'upload'
+        has_settings = bool(get_user_setting(db, user_id, f'bank_import.{source}', None))
+        if kind == 'upload' and config['folder'] in upload_by_folder:
+            # One upload card per folder (Edenred restaurant + mobility).
+            shared = upload_by_folder[config['folder']]
+            shared['label'] += f" / {config['label']}"
+            shared['has_settings'] = shared['has_settings'] or has_settings
+            continue
+        id_prefix = SYNC_ID_PREFIXES.get(source) or (config.get('open_banking') or {}).get('id_prefix')
+        entry = {
+            'key': source,
+            'label': config['label'],
+            'kind': kind,
+            'extensions': config['extensions'],
+            'has_settings': has_settings,
+            'last_sync': get_user_setting(db, user_id, f'sync.{source}', None),
+            'last_imported': latest_imported_date(db, user_id, id_prefix) if id_prefix else None,
+        }
+        if kind == 'upload':
+            upload_by_folder[config['folder']] = entry
+        if kind == 'open_banking':
+            consent = get_user_setting(db, user_id, f'enable_banking.{source}', None)
+            entry['consent'] = consent
+            entry['days_left'] = consent_days_left(consent) if consent else None
+            settings = get_user_setting(db, user_id, f'bank_import.{source}', {}) or {}
+            balance_checks = []
+            for balance in (entry['last_sync'] or {}).get('balances', []):
+                account_id = (settings.get('currency_accounts') or {}).get(str(balance['account_key']).upper())
+                app_balance = get_account_current_balance(db, user_id, account_id) if account_id else None
+                balance_checks.append({**balance, 'app_balance': app_balance})
+            entry['balance_checks'] = balance_checks
+        sources.append(entry)
+    revolut_categories = get_user_setting(db, user_id, 'revolut.custom_categories', {}) or {}
+    mintos = {
+        'has_settings': bool(get_user_setting(db, user_id, 'mintos_import', None)),
+        'files': list_mintos_files(),
+    }
+    return sources, revolut_categories, mintos
+
+
+@app.route('/sync')
+@login_required
+def sync_page():
+    db = get_db()
+    sources, revolut_categories, mintos = build_sync_context(db, current_user.id)
+    return render_template(
+        'sync.html',
+        sources=sources,
+        revolut_categories=revolut_categories,
+        mintos=mintos,
+        enable_banking_configured=bool(
+            os.environ.get('ENABLE_BANKING_APP_ID') and os.environ.get('ENABLE_BANKING_KEY_PATH')
+        ),
+    )
+
+
+def flash_sync_messages(messages):
+    for message, category in messages:
+        flash(message, category)
+
+
+def run_sync_step(label, step):
+    """Run one connector, turning its SyncError into a flash-able message."""
+    try:
+        return step()
+    except SyncError as exc:
+        return [(f'{label}: {exc}', 'danger')]
+
+
+@app.route('/sync/revolut', methods=['POST'])
+@login_required
+def sync_revolut_route():
+    db = get_db()
+    curl_text = request.form.get('curl', '')
+    if not curl_text.strip():
+        flash('Paste the cURL of the Revolut transactions/last request first.', 'warning')
+        return redirect(url_for('sync_page'))
+    flash_sync_messages(run_sync_step('Revolut', lambda: sync_revolut(db, current_user.id, curl_text)))
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/revolut/categories', methods=['POST'])
+@login_required
+def sync_revolut_categories():
+    db = get_db()
+    text = request.form.get('categories', '')
+    if '[custom.categories]' not in text.lower():
+        text = '[custom.categories]\n' + text
+    mapping = sync_connectors.parse_revolver_custom_categories(text)
+    set_user_setting(db, current_user.id, 'revolut.custom_categories', mapping)
+    db.commit()
+    flash(f'Saved {len(mapping)} Revolut custom categories.', 'success')
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/trade_republic', methods=['POST'])
+@login_required
+def sync_trade_republic_route():
+    db = get_db()
+    flash_sync_messages(run_sync_step('Trade Republic', lambda: sync_trade_republic(db, current_user.id)))
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/trade_republic/login', methods=['POST'])
+@login_required
+def sync_trade_republic_login():
+    try:
+        outcome = sync_connectors.trade_republic_login()
+    except SyncError as exc:
+        flash(f'Trade Republic: {exc}', 'danger')
+        return redirect(url_for('sync_page'))
+    flash(
+        'Trade Republic: session is still valid.' if outcome == 'already'
+        else 'Trade Republic: login confirmed. You can sync now.',
         'success',
     )
-    return redirect(url_for('investments'))
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/bank/<source>/connect', methods=['POST'])
+@login_required
+def sync_bank_connect(source):
+    config = BANK_IMPORT_SOURCES.get(source)
+    if not config or not config.get('open_banking'):
+        flash('Unknown bank.', 'danger')
+        return redirect(url_for('sync_page'))
+    try:
+        client = enable_banking_client()
+        aspsp = client.find_aspsp(config['open_banking']['aspsp'], config['open_banking']['country'])
+        state = sync_connectors.new_oauth_state()
+        auth_url = client.start_authorization(aspsp, enable_banking_redirect_url(), state)
+    except SyncError as exc:
+        flash(f"{config['label']}: {exc}", 'danger')
+        return redirect(url_for('sync_page'))
+    session['enable_banking_state'] = {'state': state, 'source': source}
+    return redirect(auth_url)
+
+
+def complete_bank_connection(code, state):
+    pending = session.pop('enable_banking_state', None)
+    if not pending or not state or state != pending.get('state'):
+        flash('Bank connection expired or did not start here. Click Connect again.', 'danger')
+        return redirect(url_for('sync_page'))
+    source = pending['source']
+    label = BANK_IMPORT_SOURCES[source]['label']
+    try:
+        consent = enable_banking_client().create_session(code)
+    except SyncError as exc:
+        flash(f'{label}: {exc}', 'danger')
+        return redirect(url_for('sync_page'))
+    db = get_db()
+    set_user_setting(db, current_user.id, f'enable_banking.{source}', consent)
+    db.commit()
+    flash(
+        f"{label}: connected {len(consent['accounts'])} account(s), consent valid until "
+        f"{str(consent.get('valid_until') or '?')[:10]}.",
+        'success',
+    )
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/callback')
+@login_required
+def sync_callback():
+    if request.args.get('error'):
+        session.pop('enable_banking_state', None)
+        flash(f"Bank connection cancelled: {request.args.get('error_description') or request.args['error']}", 'warning')
+        return redirect(url_for('sync_page'))
+    return complete_bank_connection(request.args.get('code'), request.args.get('state'))
+
+
+@app.route('/sync/callback/manual', methods=['POST'])
+@login_required
+def sync_callback_manual():
+    # For a redirect URL that isn't this app: paste the address the bank
+    # sent the browser to (it carries ?code=...&state=...).
+    query = parse_qs(urlparse(request.form.get('redirected_url', '').strip()).query)
+    return complete_bank_connection((query.get('code') or [''])[0], (query.get('state') or [''])[0])
+
+
+@app.route('/sync/bank/<source>', methods=['POST'])
+@login_required
+def sync_bank_route(source):
+    config = BANK_IMPORT_SOURCES.get(source)
+    if not config or not config.get('open_banking'):
+        flash('Unknown bank.', 'danger')
+        return redirect(url_for('sync_page'))
+    db = get_db()
+    flash_sync_messages(run_sync_step(config['label'], lambda: sync_open_banking(db, current_user.id, source)))
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/upload/<source>', methods=['POST'])
+@login_required
+def sync_upload(source):
+    """Manual sources (Edenred, Mintos): save the uploaded export and import it
+    straight away with the saved settings."""
+    db = get_db()
+    upload = request.files.get('file')
+    if not upload or not upload.filename:
+        flash('Choose a file to upload.', 'warning')
+        return redirect(url_for('sync_page'))
+    filename = secure_filename(upload.filename)
+
+    if source == 'mintos':
+        if not filename.lower().endswith(MINTOS_EXTENSIONS):
+            flash('Mintos statements must be .xlsx files.', 'danger')
+            return redirect(url_for('sync_page'))
+        os.makedirs(MINTOS_FOLDER, exist_ok=True)
+        upload.save(os.path.join(MINTOS_FOLDER, filename))
+        settings = get_user_setting(db, current_user.id, 'mintos_import', None)
+        if not settings:
+            flash(f'Saved {filename}. Import it once on Mintos Import to choose the holding.', 'warning')
+            return redirect(url_for('mintos_import'))
+        try:
+            flash(run_mintos_import(db, current_user.id, settings), 'success')
+        except ValueError as exc:
+            flash(f'Mintos: {exc}', 'danger')
+        return redirect(url_for('sync_page'))
+
+    config = BANK_IMPORT_SOURCES.get(source)
+    if not config or config.get('archived') or source in ('revolut', 'trade_republic') or config.get('open_banking'):
+        flash('Unknown upload source.', 'danger')
+        return redirect(url_for('sync_page'))
+    if not filename.lower().endswith(config['extensions']):
+        flash(f"Only {' / '.join(config['extensions'])} files can be added here.", 'danger')
+        return redirect(url_for('sync_page'))
+    os.makedirs(config['folder'], exist_ok=True)
+    upload.save(os.path.join(config['folder'], filename))
+    # Sources sharing the folder (Edenred restaurant + mobility) pick their
+    # own files by name: import the one(s) that read rows from this file.
+    imported_any = False
+    for key, other in BANK_IMPORT_SOURCES.items():
+        if other['folder'] != config['folder']:
+            continue
+        try:
+            files = load_bank_source_rows(key)['files']
+        except ValueError as exc:
+            flash(f"{other['label']}: {exc}", 'danger')
+            continue
+        if any(entry['name'] == filename and entry['row_count'] for entry in files):
+            imported_any = True
+            flash_sync_messages(import_synced_source(db, current_user.id, key, filename))
+    if not imported_any:
+        flash(f'Saved {filename}, but no rows were read from it. Check it on Bank Import.', 'warning')
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/all', methods=['POST'])
+@login_required
+def sync_all():
+    db = get_db()
+    user_id = current_user.id
+    messages = []
+    curl_text = request.form.get('curl', '')
+    if curl_text.strip():
+        messages += run_sync_step('Revolut', lambda: sync_revolut(db, user_id, curl_text))
+    if get_user_setting(db, user_id, 'bank_import.trade_republic', None):
+        messages += run_sync_step('Trade Republic', lambda: sync_trade_republic(db, user_id))
+    for source, config in BANK_IMPORT_SOURCES.items():
+        if config.get('open_banking') and get_user_setting(db, user_id, f'enable_banking.{source}', None):
+            messages += run_sync_step(config['label'], lambda source=source: sync_open_banking(db, user_id, source))
+    if not messages:
+        messages.append(('Nothing to sync yet: connect a source below first.', 'info'))
+    flash_sync_messages(messages)
+    return redirect(url_for('sync_page'))
 
 
 @app.route('/import', methods=['GET', 'POST'])

@@ -257,6 +257,11 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if request.endpoint == 'sync_page' %}active{% endif %}" href="{{ url_for('sync_page') }}">
+                                <i class="bi bi-arrow-repeat"></i> Sync
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if request.endpoint == 'import_csv' %}active{% endif %}" href="{{ url_for('import_csv') }}">
                                 <i class="bi bi-cloud-upload"></i> Import
                             </a>

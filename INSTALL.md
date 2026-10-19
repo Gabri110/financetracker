@@ -124,6 +124,32 @@ New tenants are provisioned automatically on signup through Stripe, or manually:
 python provision.py --tenant acme --email admin@acme.com
 ```
 
+## Sync connectors (`/sync`)
+
+The Sync page fetches data per source, writes it to `data/raw/<source>/` and imports it with
+the settings saved by your last manual import on **Bank Import** (do one manual import per
+source first, to map its accounts). Back up `finance.db` before the first sync.
+
+- **Revolut** — no setup. Each time: log in at app.revolut.com, DevTools → Network, "See all"
+  transactions, copy the `transactions/last` request as cURL and paste it on the Sync page.
+- **Trade Republic** — uses the unofficial [pytr](https://github.com/pytr-org/pytr). Once, in a
+  terminal inside the venv: `pytr login --v2 --store_credentials` (phone + PIN are stored by
+  pytr in `~/.pytr`, not by this app). When the session expires, click "Log in" on the Sync page
+  and approve the push in the Trade Republic app.
+- **Bankinter / ING** — open banking via [Enable Banking](https://enablebanking.com) (free
+  "restricted" mode, only your own accounts):
+  1. Sign up in the Enable Banking Control Panel and create a **production** application.
+     Download its private key (`.pem`) and keep it **outside** the repository.
+  2. Add the redirect URL `http://localhost:8000/sync/callback` (if only `https` URLs are
+     accepted, register any URL you own and use "Bank redirect didn't come back?" on the Sync
+     page to paste the address you land on).
+  3. Activate the app by linking your Bankinter/ING accounts in the Control Panel.
+  4. Set the variables before starting the app (the app does not read `.env` by itself), e.g.
+     in PowerShell: `$env:ENABLE_BANKING_APP_ID="<app id>"; $env:ENABLE_BANKING_KEY_PATH="C:\keys\eb.pem"`.
+  5. On the Sync page click **Connect**, log in at the bank, then **Fetch**. Consent lasts up to
+     180 days; the page warns two weeks before it expires.
+- **Edenred, Mintos** — no API: upload the export on the Sync page.
+
 ## Environment Variables Reference
 
 | Variable | Default | Description |
@@ -136,6 +162,9 @@ python provision.py --tenant acme --email admin@acme.com
 | `EMAIL_DOMAIN` | — | Domain used for outbound email. |
 | `STRIPE_SECRET_KEY` | — | Stripe secret API key (SaaS mode). |
 | `STRIPE_PUBLISHABLE_KEY` | — | Stripe publishable API key (SaaS mode). |
+| `ENABLE_BANKING_APP_ID` | — | Enable Banking application id (Sync page, Bankinter/ING). |
+| `ENABLE_BANKING_KEY_PATH` | — | Path to that application's private key `.pem`. |
+| `ENABLE_BANKING_REDIRECT_URL` | `http://localhost:8000/sync/callback` | Redirect URL registered in Enable Banking. |
 
 ## Backup
 

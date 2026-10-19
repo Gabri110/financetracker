@@ -65,6 +65,16 @@ Production: `gunicorn -w 4 -b 127.0.0.1:8000 app:app` (see `INSTALL.md`, `Docker
   **Yahoo Finance** chart/search endpoints (cached in-memory + DB). This is the area under
   active development (branch `feature/investment_tracking`); see `TODO.md` (in Spanish).
 
+### Bank import & Sync page
+- File importers: `BANK_IMPORT_SOURCES` + `BANK_IMPORT_PARSERS` in `app.py`; files live in
+  `data/raw/<source>/` (gitignored), dedup by `id_transaction`. Sources marked `archived`
+  (B100, Iberia Cards, MyInvestor) are no longer used but kept to re-import historic exports.
+- `/sync` (`sync_connectors.py`, the second extracted module): Revolut (pasted cURL of the
+  web app's API), Trade Republic (`pytr`), Bankinter/ING (Enable Banking PSD2). Connectors
+  write a CSV in the parser's format into the source folder, then `run_bank_import` runs
+  with the settings saved by the last manual import. State lives in user settings:
+  `sync.<source>`, `enable_banking.<source>`, `revolut.custom_categories`. See `INSTALL.md`.
+
 ### Email receipt ingestion
 - Users get an inbox address; providers (SendGrid/Mailgun/Postmark) POST to
   `/api/email/inbound`. Parsing lives in `email_processor.py`; parsed items are reviewed and

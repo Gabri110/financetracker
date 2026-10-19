@@ -18,7 +18,7 @@
         </div>
         {% else %}
 
-        {% for source_key, source in sources.items() %}
+        {% macro source_card(source_key, source) %}
         {% set settings = source.settings %}
         <div class="card mb-4">
             <div class="card-header">
@@ -55,8 +55,13 @@
                     {% if source.multi_currency %}
                     {% if source.currencies %}
                     <div class="mb-3">
+                        {% if source.open_banking %}
+                        <span class="form-label fw-bold">Bank accounts found</span>
+                        <div class="form-text mb-2">Each enabled bank account (IBAN) is imported into the selected account.</div>
+                        {% else %}
                         <span class="form-label fw-bold">Currencies found</span>
                         <div class="form-text mb-2">Each enabled currency is merged (current account + vaults) into the selected account.</div>
+                        {% endif %}
                         {% for entry in source.currencies %}
                         {% set currency = entry.currency %}
                         <input type="hidden" name="currencies" value="{{ currency }}">
@@ -182,8 +187,8 @@
                                     <em>skipped — {% if not stats.enabled %}disabled{% else %}no account mapped{% endif %}</em>
                                     {% endif %}
                                 </td>
-                                <td>{% if stats.kept %}{{ format_currency(stats.income, stats.currency) }}{% else %}—{% endif %}</td>
-                                <td>{% if stats.kept %}{{ format_currency(stats.expense, stats.currency) }}{% else %}—{% endif %}</td>
+                                <td>{% if stats.kept %}{{ format_currency(stats.income, stats.amount_currency) }}{% else %}—{% endif %}</td>
+                                <td>{% if stats.kept %}{{ format_currency(stats.expense, stats.amount_currency) }}{% else %}—{% endif %}</td>
                                 <td>{{ stats.transfers }}</td>
                             </tr>
                             {% endfor %}
@@ -260,7 +265,23 @@
             </div>
         </div>
         {% endif %}
+        {% endmacro %}
+
+        {% for source_key, source in sources.items() if not source.archived %}
+        {{ source_card(source_key, source) }}
         {% endfor %}
+
+        {% set archived_keys = sources | dictsort | selectattr('1.archived') | map(attribute='0') | list %}
+        {% if archived_keys %}
+        <details class="mb-4" {% if preview_source in archived_keys %}open{% endif %}>
+            <summary class="mb-3 text-muted">
+                <i class="bi bi-archive"></i> Archived sources ({{ archived_keys | length }}) — no longer used, kept to re-import historic exports
+            </summary>
+            {% for source_key in archived_keys %}
+            {{ source_card(source_key, sources[source_key]) }}
+            {% endfor %}
+        </details>
+        {% endif %}
 
         {% endif %}
     </div>

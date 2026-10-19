@@ -8,6 +8,11 @@
 
 # Hecho
 
+- Página `/sync`: Revolut (pegando el cURL de app.revolut.com), Trade Republic
+  (pytr), Bankinter e ING (Enable Banking, PSD2) con un clic; Edenred y Mintos
+  se suben desde la misma página y se importan con los ajustes guardados.
+  B100, Iberia Cards y MyInvestor quedan archivados (solo histórico).
+
 - Añadir inversiones desde un fichero (Trade Republic CSV + Mintos xlsx).
 - Importador de Mintos: el extracto se agrega en el holding "Mintos Lending"
   (depósitos = base de coste, valor total → evolución que registra la ganancia).

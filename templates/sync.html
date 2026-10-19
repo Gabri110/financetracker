@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+
+{% block title %}Sync - Personal Finance{% endblock %}
+
+{% macro last_run(source) %}
+<div class="small text-muted mb-2">
+    {% if source.last_imported %}Newest imported transaction: <strong>{{ source.last_imported }}</strong>.{% endif %}
+    {% if source.last_sync %}
+    Last sync {{ source.last_sync.ran_at | replace('T', ' ') }}
+    {% if source.last_sync.result == 'imported' %}
+    — {{ source.last_sync.imported }} new, {{ source.last_sync.updated }} updated.
+    {% elif source.last_sync.result == 'needs_setup' %}
+    — fetched, waiting for account mapping on <a href="{{ url_for('bank_import') }}">Bank Import</a>.
+    {% endif %}
+    {% else %}
+    Never synced from here.
+    {% endif %}
+</div>
+{% if not source.has_settings %}
+<div class="alert alert-warning small py-2">
+    Not set up yet: the first sync only fetches the data. Then map the accounts and confirm once on
+    <a href="{{ url_for('bank_import') }}">Bank Import</a>; later syncs import automatically.
+</div>
+{% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+    <h1><i class="bi bi-arrow-repeat"></i> Sync</h1>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-md-10 col-lg-8">
+
+        <form method="POST" action="{{ url_for('sync_all') }}" id="sync-all-form" class="card mb-4 border-primary">
+            <div class="card-body d-flex flex-wrap gap-2 align-items-center justify-content-between">
+                <div class="small">
+                    Fetch Trade Republic and connected banks, plus Revolut if a cURL is pasted below.
+                    Imports are idempotent: re-syncing never duplicates rows.
+                </div>
+                <button type="submit" class="btn btn-primary" onclick="document.getElementById('sync-all-curl').value = document.getElementById('revolut-curl').value;">
+                    <i class="bi bi-arrow-repeat"></i> Sync all
+                </button>
+                <input type="hidden" name="curl" id="sync-all-curl">
+            </div>
+        </form>
+
+        {% for source in sources %}
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-bank"></i> {{ source.label }}</span>
+                {% if source.kind == 'open_banking' and source.consent %}
+                {% if source.days_left is not none and source.days_left < 0 %}
+                <span class="badge bg-danger">consent expired</span>
+                {% elif source.days_left is not none and source.days_left <= 14 %}
+                <span class="badge bg-warning text-dark">consent expires in {{ source.days_left }} days</span>
+                {% else %}
+                <span class="badge bg-success">connected</span>
+                {% endif %}
+                {% endif %}
+            </div>
+            <div class="card-body">
+                {{ last_run(source) }}
+
+                {% if source.kind == 'revolut' %}
+                <form method="POST" action="{{ url_for('sync_revolut_route') }}">
+                    <label class="form-label" for="revolut-curl">Revolut session (cURL)</label>
+                    <textarea class="form-control font-monospace small" id="revolut-curl" name="curl" rows="3"
+                              placeholder="curl 'https://app.revolut.com/api/retail/user/current/transactions/last?...' -H ..."></textarea>
+                    <div class="form-text mb-2">
+                        Log in at <a href="https://app.revolut.com" target="_blank" rel="noopener">app.revolut.com</a>, open DevTools (F12) → Network,
+                        click "See all" transactions, right-click the <code>transactions/last</code> request → Copy → Copy as cURL, paste here
+                        and sync right away (the session expires within minutes). It is used once and never stored.
+                    </div>
+                    <button type="submit" class="btn btn-outline-primary"><i class="bi bi-download"></i> Fetch Revolut</button>
+                </form>
+                <details class="mt-3">
+                    <summary class="small">Revolut custom categories ({{ revolut_categories | length }} named)</summary>
+                    <form method="POST" action="{{ url_for('sync_revolut_categories') }}" class="mt-2">
+                        <textarea class="form-control font-monospace small" name="categories" rows="4"
+                                  placeholder="uuid = name (one per line), or paste RevolVer's config.ini">{% for key, name in revolut_categories | dictsort %}{{ key }} = {{ name }}
+{% endfor %}</textarea>
+                        <div class="form-text">Revolut returns custom categories as ids. Name them here (the <code>[custom.categories]</code> section of RevolVer's <code>config.ini</code> can be pasted as is).</div>
+                        <button type="submit" class="btn btn-sm btn-outline-secondary mt-2">Save categories</button>
+                    </form>
+                </details>
+
+                {% elif source.kind == 'trade_republic' %}
+                <div class="d-flex flex-wrap gap-2">
+                    <form method="POST" action="{{ url_for('sync_trade_republic_route') }}">
+                        <button type="submit" class="btn btn-outline-primary"><i class="bi bi-download"></i> Fetch Trade Republic</button>
+                    </form>
+                    <form method="POST" action="{{ url_for('sync_trade_republic_login') }}"
+                          onsubmit="this.querySelector('button').disabled = true; this.querySelector('button').innerText = 'Confirm the login in the Trade Republic app…';">
+                        <button type="submit" class="btn btn-outline-secondary"><i class="bi bi-phone"></i> Log in (approve on phone)</button>
+                    </form>
+                </div>
+                <div class="form-text">
+                    Uses <a href="https://github.com/pytr-org/pytr" target="_blank" rel="noopener">pytr</a> (unofficial). One-time setup in a terminal:
+                    <code>pytr login --v2 --store_credentials</code>. When the session expires, click "Log in" and confirm the push in the app.
+                    If the fetched ids don't match your earlier official CSV imports, nothing is imported and you're told which cut-over date to set.
+                </div>
+
+                {% elif source.kind == 'open_banking' %}
+                {% if not enable_banking_configured %}
+                <div class="alert alert-secondary small py-2">
+                    Enable Banking is not configured. Set <code>ENABLE_BANKING_APP_ID</code> and <code>ENABLE_BANKING_KEY_PATH</code> (see INSTALL.md).
+                </div>
+                {% endif %}
+                {% if source.consent %}
+                <ul class="small mb-2">
+                    {% for account in source.consent.accounts %}
+                    <li>{{ account.name or 'Account' }} <code>{{ account.iban or account.uid }}</code> ({{ account.currency }})</li>
+                    {% endfor %}
+                </ul>
+                <div class="small text-muted mb-2">Consent valid until {{ (source.consent.valid_until or '?')[:10] }}.</div>
+                {% endif %}
+                {% if source.balance_checks %}
+                <table class="table table-sm small mb-2">
+                    <thead><tr><th>Bank account</th><th>Bank balance</th><th>App balance</th></tr></thead>
+                    <tbody>
+                        {% for check in source.balance_checks %}
+                        <tr>
+                            <td><code>{{ check.account_key }}</code></td>
+                            <td>{% if check.amount is not none %}{{ format_currency(check.amount, check.currency) }}{% else %}—{% endif %}</td>
+                            <td>
+                                {% if check.app_balance is not none %}
+                                {{ format_currency(check.app_balance, check.currency) }}
+                                {% if check.amount is not none and (check.app_balance | float - check.amount | float) | abs > 0.005 %}
+                                <span class="badge bg-warning text-dark" title="Check the account's opening balance">differs</span>
+                                {% endif %}
+                                {% else %}—{% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% endif %}
+                <div class="d-flex flex-wrap gap-2">
+                    {% if source.consent %}
+                    <form method="POST" action="{{ url_for('sync_bank_route', source=source.key) }}">
+                        <button type="submit" class="btn btn-outline-primary" {% if not enable_banking_configured %}disabled{% endif %}>
+                            <i class="bi bi-download"></i> Fetch {{ source.label }}
+                        </button>
+                    </form>
+                    {% endif %}
+                    <form method="POST" action="{{ url_for('sync_bank_connect', source=source.key) }}">
+                        <button type="submit" class="btn btn-outline-secondary" {% if not enable_banking_configured %}disabled{% endif %}>
+                            <i class="bi bi-link-45deg"></i> {% if source.consent %}Renew consent{% else %}Connect {{ source.label }}{% endif %}
+                        </button>
+                    </form>
+                </div>
+
+                {% else %}
+                <form method="POST" action="{{ url_for('sync_upload', source=source.key) }}" enctype="multipart/form-data" class="d-flex flex-wrap gap-2">
+                    <input type="file" class="form-control w-auto" name="file" accept="{{ source.extensions | join(',') }}" required>
+                    <button type="submit" class="btn btn-outline-primary"><i class="bi bi-upload"></i> Upload &amp; import</button>
+                </form>
+                <div class="form-text">No API available: download the export from the website and upload it here.</div>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+
+        <div class="card mb-4">
+            <div class="card-header"><i class="bi bi-graph-up-arrow"></i> Mintos</div>
+            <div class="card-body">
+                <div class="small text-muted mb-2">{{ mintos.files | length }} statement file(s) on disk.</div>
+                {% if not mintos.has_settings %}
+                <div class="alert alert-warning small py-2">
+                    Not set up yet: import a statement once on <a href="{{ url_for('mintos_import') }}">Mintos Import</a> to choose the holding.
+                </div>
+                {% endif %}
+                <form method="POST" action="{{ url_for('sync_upload', source='mintos') }}" enctype="multipart/form-data" class="d-flex flex-wrap gap-2">
+                    <input type="file" class="form-control w-auto" name="file" accept=".xlsx" required>
+                    <button type="submit" class="btn btn-outline-primary"><i class="bi bi-upload"></i> Upload &amp; import</button>
+                </form>
+                <div class="form-text">No API available: download the full Investors Account Statement and upload it here.</div>
+            </div>
+        </div>
+
+        <details class="mb-4">
+            <summary class="small text-muted">Bank redirect didn't come back to this app?</summary>
+            <form method="POST" action="{{ url_for('sync_callback_manual') }}" class="mt-2">
+                <input type="url" class="form-control" name="redirected_url" placeholder="Paste the full address the bank redirected you to (…?code=…&state=…)" required>
+                <button type="submit" class="btn btn-sm btn-outline-secondary mt-2">Complete connection</button>
+            </form>
+        </details>
+    </div>
+</div>
+{% endblock %}
