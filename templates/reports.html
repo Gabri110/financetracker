@@ -171,7 +171,7 @@ const monthlyCtx = document.getElementById('monthlyChart').getContext('2d');
 new Chart(monthlyCtx, {
     type: 'bar',
     data: {
-        labels: [{% for row in monthly_data %}'{{ row.month }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+        labels: [{% for row in monthly_data %}{{ row.month|tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
         datasets: [{
             label: 'Income',
             data: [{% for row in monthly_data %}{{ row.income }}{% if not loop.last %}, {% endif %}{% endfor %}],
@@ -219,10 +219,10 @@ const categoryCtx = document.getElementById('categoryChart').getContext('2d');
 new Chart(categoryCtx, {
     type: 'doughnut',
     data: {
-        labels: [{% for cat in category_data %}'{{ cat.name }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+        labels: [{% for cat in category_data %}{{ cat.name|tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
         datasets: [{
             data: [{% for cat in category_data %}{{ cat.total }}{% if not loop.last %}, {% endif %}{% endfor %}],
-            backgroundColor: [{% for cat in category_data %}'{{ cat.color }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+            backgroundColor: [{% for cat in category_data %}{{ cat.color|tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
             borderWidth: 0
         }]
     },

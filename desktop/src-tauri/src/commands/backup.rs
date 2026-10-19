@@ -216,6 +216,7 @@ fn export_transactions_csv(conn: &rusqlite::Connection) -> Result<String, String
             "PAYEE",
             "ACCOUNT_NAME",
             "ACCOUNT_CURRENCY",
+            "ACCOUNT_TYPE",
             "TRANSACTION_TYPE",
         ])
         .map_err(|e| e.to_string())?;
@@ -223,7 +224,7 @@ fn export_transactions_csv(conn: &rusqlite::Connection) -> Result<String, String
     let mut stmt = conn
         .prepare(
             "SELECT t.id_transaction, t.date, t.amount, t.transaction_type, t.description, t.payee,
-                    a.name, a.currency, c.name
+                    a.name, a.currency, c.name, a.account_type
              FROM transactions t
              JOIN accounts a ON t.account_id = a.id
              LEFT JOIN categories c ON t.category_id = c.id
@@ -243,6 +244,7 @@ fn export_transactions_csv(conn: &rusqlite::Connection) -> Result<String, String
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -258,6 +260,7 @@ fn export_transactions_csv(conn: &rusqlite::Connection) -> Result<String, String
             account_name,
             account_currency,
             category,
+            account_type,
         ) = row.map_err(|e| e.to_string())?;
 
         let signed_amount = if transaction_type == "expense" { -amount } else { amount };
@@ -272,6 +275,7 @@ fn export_transactions_csv(conn: &rusqlite::Connection) -> Result<String, String
                 payee.unwrap_or_default(),
                 account_name,
                 normalize_currency(&account_currency),
+                account_type,
                 transaction_type,
             ])
             .map_err(|e| e.to_string())?;
@@ -612,13 +616,30 @@ fn import_transactions_rows(
                 .map(String::as_str)
                 .unwrap_or("USD"),
         );
-        let account_type = row
+        let explicit_type = row
             .get("ACCOUNT_TYPE")
             .map(|s| s.trim().to_lowercase())
-            .unwrap_or_else(|| "checking".to_string());
+            .filter(|s| !s.is_empty());
+        // Older backups have no ACCOUNT_TYPE per transaction: reuse the account with
+        // this name and currency when exactly one exists instead of creating a
+        // duplicate "checking" account.
+        let unambiguous_match = if explicit_type.is_none() {
+            let prefix = format!("{}||", normalize_key(&[&account_name, &account_currency]));
+            let matches: HashSet<i64> = account_map
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, id)| *id)
+                .collect();
+            if matches.len() == 1 { matches.into_iter().next() } else { None }
+        } else {
+            None
+        };
+        let account_type = explicit_type.unwrap_or_else(|| "checking".to_string());
 
         let account_key = normalize_key(&[&account_name, &account_currency, &account_type]);
-        let account_id = if let Some(id) = account_map.get(&account_key).copied() {
+        let account_id = if let Some(id) = unambiguous_match {
+            id
+        } else if let Some(id) = account_map.get(&account_key).copied() {
             id
         } else {
             conn.execute(
@@ -897,7 +918,10 @@ pub fn import_full_backup_zip_base64(
     let mut accounts_csv = String::new();
     let mut categories_csv = String::new();
     let mut rules_csv = String::new();
-    let mut transaction_csv_chunks: Vec<String> = Vec::new();
+    // The export writes every transaction twice (transactions.csv plus one file per
+    // account); read the combined file when present so rows are not processed twice.
+    let mut combined_transactions: Option<String> = None;
+    let mut per_account_transactions: Vec<String> = Vec::new();
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
@@ -911,10 +935,16 @@ pub fn import_full_backup_zip_base64(
             categories_csv = content;
         } else if name == "rules.csv" {
             rules_csv = content;
-        } else if name == "transactions.csv" || (name.starts_with("transactions_") && name.ends_with(".csv")) {
-            transaction_csv_chunks.push(content);
+        } else if name == "transactions.csv" {
+            combined_transactions = Some(content);
+        } else if name.starts_with("transactions_") && name.ends_with(".csv") {
+            per_account_transactions.push(content);
         }
     }
+    let transaction_csv_chunks = match combined_transactions {
+        Some(content) => vec![content],
+        None => per_account_transactions,
+    };
 
     import_full_payload(
         state,
@@ -983,12 +1013,15 @@ fn import_full_payload(
         tx_rows.append(&mut parsed);
     }
 
-    let (mut account_map, accounts_inserted, accounts_updated) = import_accounts_rows(conn, &account_rows)?;
-    let (category_map, categories_inserted, categories_updated) = import_categories_rows(conn, &category_rows)?;
+    // All four phases commit together; any error rolls the whole restore back.
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let (mut account_map, accounts_inserted, accounts_updated) = import_accounts_rows(&tx, &account_rows)?;
+    let (category_map, categories_inserted, categories_updated) = import_categories_rows(&tx, &category_rows)?;
     let (rules_inserted, rules_updated, rules_skipped, mut rule_warnings) =
-        import_rules_rows(conn, &rule_rows, &category_map)?;
+        import_rules_rows(&tx, &rule_rows, &category_map)?;
     let (transactions_imported, transactions_updated, tx_skipped, mut tx_warnings) =
-        import_transactions_rows(conn, &tx_rows, &mut account_map, &category_map)?;
+        import_transactions_rows(&tx, &tx_rows, &mut account_map, &category_map)?;
+    tx.commit().map_err(|e| e.to_string())?;
 
     let mut warnings = Vec::new();
     warnings.append(&mut rule_warnings);

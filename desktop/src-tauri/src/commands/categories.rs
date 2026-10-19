@@ -132,11 +132,20 @@ pub fn update_category(
 pub fn delete_category(state: tauri::State<AppState>, id: i64) -> Result<(), String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM categories WHERE id=?1", params![id])
+    // Clear every reference first (foreign keys are on): transactions become
+    // uncategorized; rules and budgets for the category are removed.
+    tx.execute("UPDATE transactions SET category_id = NULL WHERE category_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM category_rules WHERE category_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM budgets WHERE category_id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM categories WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

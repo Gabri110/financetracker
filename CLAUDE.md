@@ -5,7 +5,7 @@ Guidance for working in this repo. Personal-use project (may be published to Git
 ## What this is
 
 **FinanceTracker** — a personal finance app (accounts, transactions, budgets, reports,
-multi-currency, investments, email-receipt ingestion). It exists in two largely independent
+multi-currency, investments, bank-statement importers). It exists in two largely independent
 codebases:
 
 1. **Flask web app** (the primary one) — a single big `app.py` + Jinja `templates/`, backed
@@ -14,71 +14,98 @@ codebases:
    talks to SQLite directly via Tauri commands. It does **not** import or call the Flask app.
    Changing one does not change the other; they only share the data model conceptually.
 
-An optional **SaaS mode** (`saas.py`, Stripe, multi-tenant) is bolted on but irrelevant for
-personal use — leave it off (`SAAS_MODE=false`, the default).
+The former SaaS mode (Stripe, multi-tenant) and email-receipt ingestion were removed; old
+databases may still contain unused `email_inboxes` / `email_transactions` tables.
 
 ## Running the web app
 
 ```bash
 python -m venv .venv && .venv\Scripts\activate   # Windows; use source .venv/bin/activate on *nix
-pip install -r requirements.txt
-python app.py      # serves on http://localhost:8000  (debug=True)
+pip install -r requirements-dev.txt
+python app.py      # http://localhost:8000 (FLASK_DEBUG=1 for the debugger)
+pytest             # test suite
 ```
 
-The SQLite DB is auto-created on first request via `init_db()`; no migration step. Default
-path is `finance.db` in the repo root (override with `DATABASE`). Register a user in the UI
-to get started.
+The SQLite DB is auto-created on first request via `init_db()`, which then runs the schema
+migrations. Default path is `finance.db` in the repo root (override with `DATABASE`). Register
+a user in the UI to get started; registration closes once a user exists
+(`REGISTRATION_ENABLED=true` keeps it open). `.env` is loaded via python-dotenv.
 
-> **Ports:** `python app.py` and gunicorn serve on **8000**. The Docker setup maps host
-> **5000** → container 8000 (`docker-compose.yml`), so the docs' `localhost:5000` is correct
-> *only* for the Docker path; direct local runs are on 8000.
-
-Production: `gunicorn -w 4 -b 127.0.0.1:8000 app:app` (see `INSTALL.md`, `Dockerfile`).
+Docker: `docker compose up -d` → `http://localhost:8000`; data (DB, secret key, statement
+folders) on the `/data` volume.
 
 ## Architecture & conventions (Flask app)
 
-- **Everything lives in `app.py`** (~4600 lines): config, the full SQL schema in `init_db()`,
-  all helpers, and all `@app.route` handlers. There is no blueprint/package split for the core
-  app — when adding a feature, follow the existing flat style (route + helper functions in the
-  same file). `email_processor.py` is the one extracted module (receipt-parsing logic).
+- **Everything lives in `app.py`** (~6200 lines): config, the SQL schema in `init_db()`,
+  migrations, all helpers, the bank parsers and all `@app.route` handlers. There is no
+  blueprint/package split — when adding a feature, follow the existing flat style (route +
+  helper functions in the same file).
 - **DB access:** raw `sqlite3` via `get_db()` (per-request connection on Flask `g`,
   `row_factory = sqlite3.Row`). No ORM. Write SQL directly; always scope queries by
   `user_id = current_user.id` for user data.
 - **Auth:** `flask-login`; routes are gated with `@login_required`. Passwords hashed with
-  `pbkdf2:sha256` (`hash_password`).
-- **Templates:** Jinja in `templates/`, Bootstrap-based, charts via Chart.js (CDN). The
-  `format_currency` helper is registered as a Jinja global.
-- **Schema changes:** edit the `CREATE TABLE` statements in `init_db()`. They use
-  `CREATE TABLE IF NOT EXISTS`, so adding a column to an existing local DB needs a manual
-  `ALTER TABLE` (or delete `finance.db` to rebuild from scratch).
+  `pbkdf2:sha256` (`hash_password`). CSRF protection is the `reject_cross_site_writes`
+  Origin/Referer check plus `SameSite=Lax` cookies — no tokens needed in forms.
+- **Templates:** Jinja in `templates/`, Bootstrap-based, charts via Chart.js (CDN). Values
+  placed inside `<script>` must go through `|tojson`. Shared fragments live in
+  `templates/_macros.html`. Jinja globals: `format_currency`, `user_base_currency()`,
+  `supported_currencies`, `registration_open()`.
+- **Schema changes:** append a function to `MIGRATIONS` in `app.py` (run once each, tracked
+  by `PRAGMA user_version`); never edit or reorder existing ones. New tables can also go in
+  the `CREATE TABLE IF NOT EXISTS` script in `init_db()`. Never delete `finance.db` to
+  "rebuild" — it is real data.
+- **Form numbers:** use `form_amount()` (raises `FormInputError`, shown as a flash message)
+  rather than bare `float(request.form[...])`.
 
 ### Currency / FX
 - Per-account native currency; aggregates convert to a user **base currency** (default `EUR`).
-- Rates synced from the **ECB** daily XML (`ECB_RATES_URL`), cached in `exchange_rates`.
-- Key helpers: `get_user_base_currency`, `ensure_daily_rates`, `convert_amount`.
+- Rates synced from the **ECB** daily XML (`ECB_RATES_URL`) once a day by
+  `ensure_daily_rates` (committed; retried at most hourly when offline), stored in
+  `exchange_rates`, and loaded once per request into `g.fx_rates`.
+- `get_conversion_rate` uses direct, inverse, then cross rates through the base currency. A
+  still-missing rate converts 1:1 *and* is recorded in `g.missing_rates`, which `base.html`
+  shows as a warning.
 - Use `Decimal` for money/quantity math (see the `DECIMAL_*` constants), not float.
+
+### Imports
+- Bank parsers (`parse_revolut_csv`, `parse_trade_republic_csv`, `parse_b100_csv`,
+  `parse_edenred_xlsx`, `parse_iberia_cards_xlsx`, `parse_mintos_xlsx`) read files from
+  `DATA_DIR/raw/<bank>/`.
+- Every importer writes through `upsert_transaction_by_external_id`: re-imports refresh bank
+  data but keep the row's existing category and transaction type. Every transaction has an
+  `id_transaction` (manual rows get `manual_<random>` from a trigger).
+- Category matching for imports: `match_import_category` (rules via `load_category_rules` +
+  `auto_categorize_transaction`, then a loose name match).
 
 ### Investments
 - Tables: `investment_holdings`, `investment_operations`, `investment_snapshots`,
   `investment_valuations`, `market_symbol_cache`. Routes under `/investments/...`.
 - Asset classes in `INVESTMENT_ASSET_CLASSES`; live prices pulled from **Stooq** and
-  **Yahoo Finance** chart/search endpoints (cached in-memory + DB). This is the area under
-  active development (branch `feature/investment_tracking`); see `TODO.md` (in Spanish).
-
-### Email receipt ingestion
-- Users get an inbox address; providers (SendGrid/Mailgun/Postmark) POST to
-  `/api/email/inbound`. Parsing lives in `email_processor.py`; parsed items are reviewed and
-  approved into transactions.
+  **Yahoo Finance** chart/search endpoints (cached in-memory + DB).
+- `VALUATION_TRACKED_CLASSES` (Mintos, Fixed Income Fund) move through evolution valuations:
+  the return lives in the value itself — never also write a 'dividend' operation for it.
+  Evolution baselines come from `get_holding_base_value` (last valuation + contributions
+  since). Trades only overwrite `current_price` via `trade_price_or_current`.
+- See `ROADMAP.md` for known gaps (transfers, refunds, TR sells/dividends, Mintos withdrawals).
 
 ## Data & secrets
 
-- **`finance.db` is real personal financial data.** Do not commit it, delete it, or paste its
-  contents into anything external. It's gitignored.
-- Copy `.env.example` → `.env` for config. Never commit real `SECRET_KEY` or Stripe keys.
-- Import/export: full backup as `/export/full.zip` and `.xlsx`; restore via `/import/full`.
+- **`finance.db` is real personal financial data**, and so are `data/raw/*`, `data.zip` and any
+  `*.db` backup. Do not commit, delete, or paste their contents into anything external. All
+  are gitignored; tests use synthetic fixtures only.
+- The session key is generated into `instance/secret_key` (gitignored) unless `SECRET_KEY` is set.
+- Backups: `/export/database` (complete SQLite snapshot, single-user only) or the
+  spreadsheet export `/export/full.zip` / `.xlsx` (accounts, categories, rules,
+  transactions), restored via `/import/full`.
+
+## Security model
+
+Single user on localhost. Deliberately **not** implemented (revisit before exposing the app):
+per-user import folders (`data/raw` is shared), ownership checks on every form ID, per-user
+exchange rates, regex-rule ReDoS limits, and spreadsheet formula escaping in exports.
 
 ## Notes
 
-- No automated test suite exists. Verify changes by running the app and exercising the route.
-- Stray `.DS_Store` files are macOS artifacts — ignore.
+- Tests: `pytest` (`tests/`); `tests/conftest.py` gives each test a fresh DB, stubs the ECB
+  fetch, and points the bank folders at a temp dir.
 - This is a single-user-focused project; favor simple, direct solutions over abstraction.

@@ -1,7 +1,6 @@
 use crate::AppState;
 use crate::commands::fx::{
     convert_amount_from_conn,
-    ensure_daily_rates_from_conn,
     get_base_currency_from_conn,
 };
 use rusqlite::params;
@@ -26,8 +25,6 @@ pub struct Budget {
 pub fn get_budgets(state: tauri::State<AppState>) -> Result<Vec<Budget>, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("No database open")?;
-
-    ensure_daily_rates_from_conn(conn)?;
 
     // Get current month range for spending calculation
     let now = chrono::Local::now();
@@ -71,6 +68,7 @@ pub fn get_budgets(state: tauri::State<AppState>) -> Result<Vec<Budget>, String>
              FROM transactions t
              JOIN accounts a ON t.account_id = a.id
              WHERE t.transaction_type = 'expense'
+               AND t.category_id IS NOT NULL
                AND t.date BETWEEN ?1 AND ?2",
         )
         .map_err(|e| e.to_string())?;

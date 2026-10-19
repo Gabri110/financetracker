@@ -37,7 +37,7 @@
 
                 <hr>
 
-                {% if config.REGISTRATION_ENABLED %}
+                {% if registration_open() %}
                 <p class="text-center mb-0">
                     Don't have an account? <a href="{{ url_for('register') }}">Register</a>
                 </p>

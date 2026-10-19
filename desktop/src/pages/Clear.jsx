@@ -1,9 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { getTransactions, updateTransaction, getCategories } from "../api/tauri";
-
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
+import { fmt } from "../format";
 
 export default function Clear() {
   const { t } = useTranslation();

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from '_macros.html' import category_optgroups %}
 
 {% block title %}Clear Transactions - Personal Finance{% endblock %}
 
@@ -188,16 +189,7 @@
                 <div class="mb-3">
                     <label class="form-label">Category</label>
                     <select class="form-select" id="rule-category">
-                        <optgroup label="Expenses">
-                            {% for cat in categories if cat.category_type == 'expense' %}
-                            <option value="{{ cat.id }}">{{ cat.icon }} {{ cat.name }}</option>
-                            {% endfor %}
-                        </optgroup>
-                        <optgroup label="Income">
-                            {% for cat in categories if cat.category_type == 'income' %}
-                            <option value="{{ cat.id }}">{{ cat.icon }} {{ cat.name }}</option>
-                            {% endfor %}
-                        </optgroup>
+                        {{ category_optgroups(categories, None, ('expense', 'income')) }}
                     </select>
                 </div>
             </div>
@@ -266,7 +258,9 @@ document.addEventListener('DOMContentLoaded', function() {
     function selectCategory(categoryId, categoryName) {
         selectedCategoryId = categoryId;
         selectedCategoryName = categoryName;
-        selectedCategoryDiv.innerHTML = `<strong>${categoryName}</strong>`;
+        const strong = document.createElement('strong');
+        strong.textContent = categoryName;
+        selectedCategoryDiv.replaceChildren(strong);
         applyBtn.disabled = false;
 
         categoryBtns.forEach(btn => {

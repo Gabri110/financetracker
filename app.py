@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import re
+import secrets
 import sqlite3
 import hashlib
 import zipfile
@@ -10,29 +11,71 @@ import importlib
 from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from datetime import datetime
-from functools import wraps
 from urllib.error import HTTPError
 from urllib import request as urllib_request
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 import xml.etree.ElementTree as ET
 
-from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file
+from flask import Flask, render_template, request, redirect, url_for, flash, g, jsonify, send_file, abort
 from flask import has_app_context
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # python-dotenv is optional; plain env vars still work
+    pass
 
 # Use pbkdf2 method since scrypt may not be available on all systems
 def hash_password(password):
     return generate_password_hash(password, method='pbkdf2:sha256')
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+
+def load_secret_key():
+    """Use SECRET_KEY from the environment, else a random key persisted in
+    SECRET_KEY_FILE (default instance/secret_key)."""
+    key = os.environ.get('SECRET_KEY', '').strip()
+    if key:
+        return key
+    path = os.environ.get('SECRET_KEY_FILE') or os.path.join(app.instance_path, 'secret_key')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            key = handle.read().strip()
+    except FileNotFoundError:
+        key = ''
+    if not key:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        key = secrets.token_hex(32)
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(key)
+    return key
+
+
+app.config['SECRET_KEY'] = load_secret_key()
 app.config['DATABASE'] = os.environ.get('DATABASE', 'finance.db')
-app.config['SAAS_MODE'] = os.environ.get('SAAS_MODE', 'false').lower() == 'true'
-app.config['REGISTRATION_ENABLED'] = os.environ.get('REGISTRATION_ENABLED', 'true').lower() == 'true'
+# Registration is open until the first user exists; REGISTRATION_ENABLED=true keeps it open.
+app.config['REGISTRATION_ENABLED'] = os.environ.get('REGISTRATION_ENABLED', '').lower() == 'true'
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+BACKUP_MAX_MEMBERS = 500
+BACKUP_MAX_MEMBER_BYTES = 50 * 1024 * 1024
+CATEGORY_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+DEFAULT_CATEGORY_COLOR = '#6c757d'
+
+
+def normalize_category_color(value):
+    """Category colors end up in style attributes and chart JS; only allow #rrggbb."""
+    value = (value or '').strip()
+    return value if CATEGORY_COLOR_RE.match(value) else DEFAULT_CATEGORY_COLOR
 
 DEFAULT_BASE_CURRENCY = 'EUR'
+# Bank-statement drop folders live in <DATA_DIR>/raw/<bank>/ (Docker: on the /data volume).
+DATA_DIR = os.environ.get('DATA_DIR', 'data')
+RAW_DATA_DIR = os.path.join(DATA_DIR, 'raw')
 ECB_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
 SUPPORTED_CURRENCIES = {'EUR', 'USD', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'SEK', 'NOK', 'DKK', 'MXN'}
 INVESTMENT_ASSET_CLASSES = (
@@ -42,12 +85,18 @@ INVESTMENT_ASSET_CLASSES = (
     'Private Equity Fund',
     'Mintos Lending',
 )
+# Classes whose value moves through manual/imported "evolution" valuations rather
+# than market prices; their returns are read from investment_valuations.
+VALUATION_TRACKED_CLASSES = ('Mintos Lending', 'Fixed Income Fund')
+# Note on the duplicate 'dividend' operations older versions wrote per valuation
+# (removed by migrate_drop_synthetic_return_ops).
+SYNTHETIC_RETURN_NOTE_PREFIX = 'Auto return from valuation'
 INVESTMENT_INCOME_PROFILES = ('fixed', 'variable')
 INVESTMENT_MARKET_SYNCABLE_CLASSES = ('ETF', 'IF', 'Fixed Income Fund', 'Private Equity Fund')
 BANK_IMPORT_SOURCES = {
     'revolut': {
         'label': 'Revolut',
-        'folder': os.path.join('data', 'raw', 'revolut'),
+        'folder': os.path.join(RAW_DATA_DIR, 'revolut'),
         'extensions': ('.csv',),
         'multi_currency': True,
         'investments': False,
@@ -57,21 +106,21 @@ BANK_IMPORT_SOURCES = {
     },
     'trade_republic': {
         'label': 'Trade Republic',
-        'folder': os.path.join('data', 'raw', 'trade_republic'),
+        'folder': os.path.join(RAW_DATA_DIR, 'trade_republic'),
         'extensions': ('.csv',),
         'multi_currency': False,
         'investments': True,
     },
     'b100': {
         'label': 'B100',
-        'folder': os.path.join('data', 'raw', 'B100'),
+        'folder': os.path.join(RAW_DATA_DIR, 'B100'),
         'extensions': ('.csv',),
         'multi_currency': False,
         'investments': False,
     },
     'edenred_restaurant': {
         'label': 'Edenred Restaurante',
-        'folder': os.path.join('data', 'raw', 'edenred'),
+        'folder': os.path.join(RAW_DATA_DIR, 'edenred'),
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
@@ -82,7 +131,7 @@ BANK_IMPORT_SOURCES = {
     },
     'edenred_mobility': {
         'label': 'Edenred Movilidad',
-        'folder': os.path.join('data', 'raw', 'edenred'),
+        'folder': os.path.join(RAW_DATA_DIR, 'edenred'),
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
@@ -90,7 +139,7 @@ BANK_IMPORT_SOURCES = {
     },
     'iberia_cards': {
         'label': 'Iberia Cards',
-        'folder': os.path.join('data', 'raw', 'iberia_cards'),
+        'folder': os.path.join(RAW_DATA_DIR, 'iberia_cards'),
         'extensions': ('.xlsx',),
         'multi_currency': False,
         'investments': False,
@@ -110,7 +159,7 @@ TRADE_REPUBLIC_ASSET_CLASS_MAP = {
 # Mintos statements (data/raw/mintos/*.xlsx) are imported into the single
 # 'Mintos Lending' holding: external deposits become cost basis, and the current
 # total value (deposits + net earnings) is booked via an evolution valuation.
-MINTOS_FOLDER = os.path.join('data', 'raw', 'mintos')
+MINTOS_FOLDER = os.path.join(RAW_DATA_DIR, 'mintos')
 MINTOS_EXTENSIONS = ('.xlsx',)
 MINTOS_DEPOSIT_TYPES = {'deposits', 'investors card deposits'}
 MINTOS_INTERNAL_TYPES = {
@@ -193,12 +242,6 @@ def format_currency(amount, currency):
 
 
 app.jinja_env.globals['format_currency'] = format_currency
-
-# Register SaaS blueprint if in SaaS mode
-if app.config['SAAS_MODE']:
-    from saas import saas_bp, init_saas_db
-    app.register_blueprint(saas_bp)
-
 
 # Database helper functions
 def get_db():
@@ -285,42 +328,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id),
             FOREIGN KEY (category_id) REFERENCES categories (id)
-        );
-
-        CREATE TABLE IF NOT EXISTS email_inboxes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            email_address TEXT UNIQUE NOT NULL,
-            email_token TEXT UNIQUE NOT NULL,
-            default_account_id INTEGER,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (default_account_id) REFERENCES accounts (id)
-        );
-
-        CREATE TABLE IF NOT EXISTS email_transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            inbox_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            sender_email TEXT,
-            subject TEXT,
-            received_at TIMESTAMP,
-            parsed_vendor TEXT,
-            parsed_amount REAL,
-            parsed_currency TEXT DEFAULT 'EUR',
-            parsed_date DATE,
-            parsed_description TEXT,
-            suggested_category_id INTEGER,
-            raw_body TEXT,
-            attachments TEXT,
-            transaction_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (inbox_id) REFERENCES email_inboxes (id),
-            FOREIGN KEY (suggested_category_id) REFERENCES categories (id),
-            FOREIGN KEY (transaction_id) REFERENCES transactions (id)
         );
 
         CREATE TABLE IF NOT EXISTS exchange_rates (
@@ -411,42 +418,93 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         );
     ''')
-
-    # Add optional external transaction reference used by CSV imports.
-    transaction_columns = {
-        row['name'] for row in db.execute('PRAGMA table_info(transactions)').fetchall()
-    }
-    if 'id_transaction' not in transaction_columns:
-        db.execute('ALTER TABLE transactions ADD COLUMN id_transaction TEXT')
-
-    user_columns = {
-        row['name'] for row in db.execute('PRAGMA table_info(users)').fetchall()
-    }
-    if 'base_currency' not in user_columns:
-        db.execute(f"ALTER TABLE users ADD COLUMN base_currency TEXT DEFAULT '{DEFAULT_BASE_CURRENCY}'")
-
-    account_columns = {
-        row['name'] for row in db.execute('PRAGMA table_info(accounts)').fetchall()
-    }
-    if 'income_profile' not in account_columns:
-        db.execute("ALTER TABLE accounts ADD COLUMN income_profile TEXT")
-    if 'is_investment_dashboard' not in account_columns:
-        db.execute('ALTER TABLE accounts ADD COLUMN is_investment_dashboard INTEGER DEFAULT 0')
-
-    holding_columns = {
-        row['name'] for row in db.execute('PRAGMA table_info(investment_holdings)').fetchall()
-    }
-    if 'isin' not in holding_columns:
-        db.execute('ALTER TABLE investment_holdings ADD COLUMN isin TEXT')
-
-    # External reference used by bank imports to make operation creation idempotent.
-    operation_columns = {
-        row['name'] for row in db.execute('PRAGMA table_info(investment_operations)').fetchall()
-    }
-    if 'id_transaction' not in operation_columns:
-        db.execute('ALTER TABLE investment_operations ADD COLUMN id_transaction TEXT')
-
     db.commit()
+    run_migrations(db)
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations. PRAGMA user_version records how many have run; to change
+# the schema of existing databases, append a function to MIGRATIONS (never edit
+# or reorder the ones already there).
+# ---------------------------------------------------------------------------
+
+def add_column_if_missing(db, table, column, definition):
+    columns = {row['name'] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
+    if column in columns:
+        return
+    try:
+        db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+    except sqlite3.OperationalError as exc:
+        # Another worker may have added it between the check and the ALTER.
+        if 'duplicate column' not in str(exc).lower():
+            raise
+
+
+def migrate_add_late_columns(db):
+    """Columns added after the first release (previously ad-hoc checks in init_db)."""
+    add_column_if_missing(db, 'transactions', 'id_transaction', 'TEXT')
+    add_column_if_missing(db, 'users', 'base_currency', f"TEXT DEFAULT '{DEFAULT_BASE_CURRENCY}'")
+    add_column_if_missing(db, 'accounts', 'income_profile', 'TEXT')
+    add_column_if_missing(db, 'accounts', 'is_investment_dashboard', 'INTEGER DEFAULT 0')
+    add_column_if_missing(db, 'investment_holdings', 'isin', 'TEXT')
+    # External reference used by bank imports to make operation creation idempotent.
+    add_column_if_missing(db, 'investment_operations', 'id_transaction', 'TEXT')
+
+
+def migrate_add_indexes(db):
+    for statement in (
+        'CREATE INDEX IF NOT EXISTS idx_transactions_user_ext ON transactions (user_id, id_transaction)',
+        'CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions (user_id, date)',
+        'CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions (account_id)',
+        'CREATE INDEX IF NOT EXISTS idx_investment_operations_holding ON investment_operations (holding_id)',
+    ):
+        db.execute(statement)
+
+
+def migrate_drop_synthetic_return_ops(db):
+    """Evolution returns live in investment_valuations.return_amount. Older code also
+    wrote a matching 'dividend' operation for each one, double-counting the return."""
+    db.execute(
+        f"""DELETE FROM investment_operations
+           WHERE operation_type = 'dividend' AND note LIKE '{SYNTHETIC_RETURN_NOTE_PREFIX}%'"""
+    )
+
+
+def migrate_external_ids_for_manual_rows(db):
+    """Give every transaction an external id so backups round-trip: manual rows
+    used to export without one, so restoring duplicated them and two identical
+    manual entries collapsed into one. A trigger covers rows inserted later."""
+    db.execute(
+        """UPDATE transactions SET id_transaction = 'manual_' || lower(hex(randomblob(8)))
+           WHERE id_transaction IS NULL OR id_transaction = ''"""
+    )
+    db.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_transactions_external_id
+           AFTER INSERT ON transactions
+           WHEN NEW.id_transaction IS NULL OR NEW.id_transaction = ''
+           BEGIN
+               UPDATE transactions SET id_transaction = 'manual_' || lower(hex(randomblob(8)))
+               WHERE id = NEW.id;
+           END"""
+    )
+
+
+MIGRATIONS = [
+    migrate_add_late_columns,
+    migrate_add_indexes,
+    migrate_drop_synthetic_return_ops,
+    migrate_external_ids_for_manual_rows,
+]
+
+
+def run_migrations(db):
+    version = db.execute('PRAGMA user_version').fetchone()[0]
+    for number, migration in enumerate(MIGRATIONS, start=1):
+        if number <= version:
+            continue
+        migration(db)
+        db.execute(f'PRAGMA user_version = {number}')
+        db.commit()
 
 
 def get_user_base_currency(user_id):
@@ -458,6 +516,16 @@ def get_user_base_currency(user_id):
     if not row:
         return DEFAULT_BASE_CURRENCY
     return normalize_currency(row['base_currency'])
+
+
+def current_user_base_currency():
+    if has_app_context() and current_user and current_user.is_authenticated:
+        return get_user_base_currency(current_user.id)
+    return DEFAULT_BASE_CURRENCY
+
+
+app.jinja_env.globals['user_base_currency'] = current_user_base_currency
+app.jinja_env.globals['supported_currencies'] = sorted(SUPPORTED_CURRENCIES)
 
 
 def get_user_setting(db, user_id, key, default=None):
@@ -513,23 +581,34 @@ def fetch_ecb_rates_for_base(base_currency):
     return rates
 
 
+RATE_SYNC_RETRY_SECONDS = 3600
+_last_rate_sync_attempt = {}
+
+
 def ensure_daily_rates(db, base_currency):
     base_currency = normalize_currency(base_currency)
-    today = datetime.now().strftime('%Y-%m-%d')
 
+    # updated_at is CURRENT_TIMESTAMP (UTC), so compare against SQLite's UTC date too.
     has_today_rates = db.execute(
         '''SELECT 1 FROM exchange_rates
-           WHERE to_currency = ? AND date(updated_at) = ?
+           WHERE to_currency = ? AND date(updated_at) = date('now')
            LIMIT 1''',
-        (base_currency, today),
+        (base_currency,),
     ).fetchone()
     if has_today_rates:
         return
 
+    # When offline, don't stall every page on the ECB timeout: retry hourly.
+    now = datetime.now().timestamp()
+    if now - _last_rate_sync_attempt.get(base_currency, 0) < RATE_SYNC_RETRY_SECONDS:
+        return
+    _last_rate_sync_attempt[base_currency] = now
+
     try:
         sync_rates_for_base(db, base_currency)
+        db.commit()
     except Exception:
-        return
+        db.rollback()
 
 
 def sync_rates_for_base(db, base_currency):
@@ -548,7 +627,26 @@ def sync_rates_for_base(db, base_currency):
 
         upserted += 1
 
+    invalidate_rate_cache()
     return upserted
+
+
+def load_rate_table(db):
+    """All stored rates as {(from, to): rate}, read once per request."""
+    if has_app_context() and 'fx_rates' in g:
+        return g.fx_rates
+    table = {
+        (row['from_currency'], row['to_currency']): float(row['rate'])
+        for row in db.execute('SELECT from_currency, to_currency, rate FROM exchange_rates WHERE rate > 0')
+    }
+    if has_app_context():
+        g.fx_rates = table
+    return table
+
+
+def invalidate_rate_cache():
+    if has_app_context():
+        g.pop('fx_rates', None)
 
 
 def get_conversion_rate(db, from_currency, to_currency):
@@ -558,28 +656,16 @@ def get_conversion_rate(db, from_currency, to_currency):
     if from_currency == to_currency:
         return 1.0
 
-    direct = db.execute(
-        '''SELECT rate FROM exchange_rates
-           WHERE from_currency = ? AND to_currency = ?
-           ORDER BY updated_at DESC
-           LIMIT 1''',
-        (from_currency, to_currency),
-    ).fetchone()
-    if direct and direct['rate']:
-        return float(direct['rate'])
+    rates = load_rate_table(db)
+    if (from_currency, to_currency) in rates:
+        return rates[(from_currency, to_currency)]
+    if (to_currency, from_currency) in rates:
+        return 1.0 / rates[(to_currency, from_currency)]
 
-    inverse = db.execute(
-        '''SELECT rate FROM exchange_rates
-           WHERE from_currency = ? AND to_currency = ?
-           ORDER BY updated_at DESC
-           LIMIT 1''',
-        (to_currency, from_currency),
-    ).fetchone()
-    if inverse and inverse['rate']:
-        try:
-            return 1.0 / float(inverse['rate'])
-        except ZeroDivisionError:
-            return None
+    # Rates are stored as X -> base currency; cross two of them through that base.
+    for (source, pivot), rate in rates.items():
+        if source == from_currency and (to_currency, pivot) in rates:
+            return rate / rates[(to_currency, pivot)]
 
     return None
 
@@ -587,6 +673,11 @@ def get_conversion_rate(db, from_currency, to_currency):
 def convert_amount(db, amount, from_currency, to_currency):
     rate = get_conversion_rate(db, from_currency, to_currency)
     if rate is None:
+        # Shown unconverted; base.html warns about it instead of failing silently.
+        if has_app_context():
+            g.setdefault('missing_rates', set()).add(
+                (normalize_currency(from_currency), normalize_currency(to_currency))
+            )
         return float(amount)
     return float(amount) * rate
 
@@ -844,9 +935,16 @@ def fetch_yahoo_price(identifier):
     if close_price is None:
         raise ValueError('Yahoo returned no close values.')
 
+    quote_currency = (meta.get('currency') or '').strip()
+    # London listings quote in pence ('GBp'/'GBX'); normalizing that to GBP
+    # would value the holding 100x too high.
+    if quote_currency in ('GBp', 'GBX'):
+        close_price /= 100.0
+        quote_currency = 'GBP'
+
     return {
         'price': close_price,
-        'currency': normalize_currency(meta.get('currency', '')),
+        'currency': normalize_currency(quote_currency),
         'source': f'Yahoo ({query_symbol})',
     }
 
@@ -910,9 +1008,11 @@ def convert_quote_to_holding_currency(db, quote_price, quote_currency, holding_c
 
 
 def detect_delimiter(sample_text):
-    if '\t' in sample_text:
+    # Only the header line is trusted: descriptions in data rows may contain ';'.
+    header = (sample_text or '').lstrip('﻿').split('\n', 1)[0]
+    if '\t' in header:
         return '\t'
-    if ';' in sample_text:
+    if header.count(';') > header.count(','):
         return ';'
     return ','
 
@@ -923,17 +1023,23 @@ def parse_amount_string(raw_amount):
         raise ValueError('Missing amount')
 
     if ',' in amount_str and '.' in amount_str:
+        # Both present: whichever comes last is the decimal separator.
         last_comma = amount_str.rfind(',')
         last_dot = amount_str.rfind('.')
         if last_comma > last_dot:
             amount_str = amount_str.replace('.', '').replace(',', '.')
         else:
             amount_str = amount_str.replace(',', '')
-    elif ',' in amount_str:
-        if re.search(r',\d{2}$', amount_str):
-            amount_str = amount_str.replace(',', '.')
-        else:
-            amount_str = amount_str.replace(',', '')
+    else:
+        separator = ',' if ',' in amount_str else '.' if '.' in amount_str else None
+        if separator:
+            integer_part, _, fraction = amount_str.rpartition(separator)
+            digits = integer_part.lstrip('+-')
+            is_grouping = amount_str.count(separator) > 1 or (
+                len(fraction) == 3 and 1 <= len(digits) <= 3 and digits != '0'
+            )
+            # '1.234' / '1,234' / '1.234.567' are thousands; '12,5' / '0,5' / '0.125' are decimals.
+            amount_str = amount_str.replace(separator, '') if is_grouping else amount_str.replace(separator, '.')
 
     return float(amount_str)
 
@@ -1047,7 +1153,7 @@ def fetch_transactions_export_rows(db, user_id, filters=None):
     filters = filters or {}
     query = '''
         SELECT t.id_transaction, t.date, t.transaction_type, t.amount, t.description, t.payee,
-               a.name AS account_name, a.currency AS account_currency,
+               a.name AS account_name, a.currency AS account_currency, a.account_type,
                c.name AS category_name
         FROM transactions t
         JOIN accounts a ON t.account_id = a.id
@@ -1101,9 +1207,16 @@ def fetch_transactions_export_rows(db, user_id, filters=None):
             'PAYEE': row['payee'] or '',
             'ACCOUNT_NAME': row['account_name'],
             'ACCOUNT_CURRENCY': normalize_currency(row['account_currency']),
+            'ACCOUNT_TYPE': row['account_type'],
             'TRANSACTION_TYPE': row['transaction_type'],
         })
     return rows
+
+
+TRANSACTION_EXPORT_HEADERS = [
+    'ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION', 'PAYEE',
+    'ACCOUNT_NAME', 'ACCOUNT_CURRENCY', 'ACCOUNT_TYPE', 'TRANSACTION_TYPE',
+]
 
 
 def upsert_accounts_from_rows(db, user_id, account_rows):
@@ -1154,7 +1267,7 @@ def upsert_categories_from_rows(db, user_id, category_rows):
             continue
 
         icon = (row.get('ICON') or '📁').strip() or '📁'
-        color = (row.get('COLOR') or '#6c757d').strip() or '#6c757d'
+        color = normalize_category_color(row.get('COLOR'))
         key = normalized_key(name, category_type)
         existing_id = cache.get(key)
 
@@ -1231,12 +1344,20 @@ def upsert_rules_from_rows(db, user_id, rule_rows, category_cache):
     return inserted, updated, skipped, errors
 
 
-def resolve_or_create_account_id(db, user_id, account_cache, account_name, account_currency, account_type='checking'):
+def resolve_or_create_account_id(db, user_id, account_cache, account_name, account_currency, account_type=None):
     normalized_name = (account_name or '').strip()
     if not normalized_name:
         return None
 
     normalized_currency = normalize_currency(account_currency)
+    if not (account_type or '').strip():
+        # Older backups carry no ACCOUNT_TYPE per transaction: reuse the account
+        # with this name and currency when that is unambiguous.
+        prefix = normalized_key(normalized_name, normalized_currency) + '||'
+        matches = {cid for key, cid in account_cache.items() if key.startswith(prefix)}
+        if len(matches) == 1:
+            return matches.pop()
+
     normalized_type = (account_type or 'checking').strip().lower()
     key = normalized_key(normalized_name, normalized_currency, normalized_type)
     existing_id = account_cache.get(key)
@@ -1284,7 +1405,7 @@ def upsert_transactions_from_rows(db, user_id, transaction_rows, account_cache, 
         try:
             account_name = (row.get('ACCOUNT_NAME') or '').strip()
             account_currency = row.get('ACCOUNT_CURRENCY') or DEFAULT_BASE_CURRENCY
-            account_type = row.get('ACCOUNT_TYPE') or 'checking'
+            account_type = row.get('ACCOUNT_TYPE') or None
             account_id = resolve_or_create_account_id(
                 db, user_id, account_cache, account_name, account_currency, account_type
             )
@@ -1316,42 +1437,25 @@ def upsert_transactions_from_rows(db, user_id, transaction_rows, account_cache, 
                     account_name, account_currency, date_value, normalized_amount, description, payee
                 )
 
-            existing = db.execute(
-                '''SELECT id FROM transactions
-                   WHERE user_id = ? AND account_id = ? AND id_transaction = ?
-                   ORDER BY id DESC''',
-                (user_id, account_id, id_transaction),
-            ).fetchall()
-
-            if existing:
-                keep_id = existing[0]['id']
-                db.execute(
-                    '''UPDATE transactions
-                       SET category_id = ?, transaction_type = ?, amount = ?, description = ?, payee = ?, date = ?
-                       WHERE id = ? AND user_id = ?''',
-                    (category_id, transaction_type, normalized_amount, description, payee, date_value, keep_id, user_id),
-                )
-                for duplicate_row in existing[1:]:
-                    db.execute('DELETE FROM transactions WHERE id = ? AND user_id = ?', (duplicate_row['id'], user_id))
-                updated += 1
-            else:
-                db.execute(
-                    '''INSERT INTO transactions
-                       (user_id, account_id, category_id, transaction_type, amount, description, payee, date, id_transaction)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                    (
-                        user_id,
-                        account_id,
-                        category_id,
-                        transaction_type,
-                        normalized_amount,
-                        description,
-                        payee,
-                        date_value,
-                        id_transaction,
-                    ),
-                )
+            outcome = upsert_transaction_by_external_id(
+                db, user_id,
+                {
+                    'account_id': account_id,
+                    'category_id': category_id,
+                    'transaction_type': transaction_type,
+                    'amount': normalized_amount,
+                    'description': description,
+                    'payee': payee,
+                    'date': date_value,
+                    'id_transaction': id_transaction,
+                },
+                [id_transaction],
+                account_scope=account_id,
+            )
+            if outcome == 'inserted':
                 imported += 1
+            else:
+                updated += 1
         except Exception as exc:
             skipped += 1
             errors.append(f'Row {idx}: {exc}')
@@ -1520,10 +1624,8 @@ def create_default_categories(user_id):
     db.commit()
 
 
-def auto_categorize_transaction(user_id, description, payee):
-    """Try to match a transaction to a category based on rules."""
-    db = get_db()
-    rules = db.execute('''
+def load_category_rules(db, user_id):
+    return db.execute('''
         SELECT r.*, c.name as category_name
         FROM category_rules r
         JOIN categories c ON r.category_id = c.id
@@ -1531,21 +1633,92 @@ def auto_categorize_transaction(user_id, description, payee):
         ORDER BY r.priority DESC, r.id ASC
     ''', (user_id,)).fetchall()
 
-    text_to_match = f"{description} {payee}".lower()
+
+def auto_categorize_transaction(user_id, description, payee, rules=None):
+    """Try to match a transaction to a category based on rules. Pass `rules`
+    (from load_category_rules) when categorizing many rows at once."""
+    if rules is None:
+        rules = load_category_rules(get_db(), user_id)
 
     for rule in rules:
-        pattern = rule['pattern'].lower()
+        # match_field 'payee' = payee only; anything else = description and payee.
+        if rule['match_field'] == 'payee':
+            text_to_match = payee or ''
+        else:
+            text_to_match = f"{description or ''} {payee or ''}"
         if rule['is_regex']:
             try:
-                if re.search(pattern, text_to_match, re.IGNORECASE):
+                # Never lowercase a regex: that turns \D \S \W into \d \s \w.
+                if re.search(rule['pattern'], text_to_match, re.IGNORECASE):
                     return rule['category_id']
             except re.error:
                 continue
-        else:
-            if pattern in text_to_match:
-                return rule['category_id']
+        elif rule['pattern'].lower() in text_to_match.lower():
+            return rule['category_id']
 
     return None
+
+
+def match_import_category(user_id, rules, categories, description, payee, category_text):
+    """Category for an imported row: a user rule first, else a loose name match
+    against the category text the bank export provides."""
+    category_id = auto_categorize_transaction(user_id, description, payee or category_text, rules=rules)
+    if not category_id and category_text:
+        text = category_text.lower()
+        for cat in categories:
+            if cat['name'].lower() in text or text in cat['name'].lower():
+                return cat['id']
+    return category_id
+
+
+def upsert_transaction_by_external_id(db, user_id, values, match_ids, account_scope=None):
+    """Insert a transaction, or refresh the existing one carrying the same external id.
+
+    `values` holds account_id, category_id, transaction_type, amount, description,
+    payee, date and id_transaction. `match_ids` are tried in order (e.g. the id and a
+    legacy id); `account_scope` limits the lookup to one account (None = user-wide).
+    On update the bank data (account, amount, date, text) is refreshed, but a
+    category or transaction type already on the row is kept, so re-importing never
+    undoes manual categorization or a row you marked as a transfer.
+    Returns 'inserted', 'updated' or 'migrated' (matched through a fallback id)."""
+    existing = []
+    matched_index = 0
+    for matched_index, external_id in enumerate(i for i in match_ids if i):
+        params = [user_id, external_id]
+        scope = ''
+        if account_scope is not None:
+            scope = ' AND account_id = ?'
+            params.append(account_scope)
+        existing = db.execute(
+            f'SELECT id FROM transactions WHERE user_id = ? AND id_transaction = ?{scope} ORDER BY id DESC',
+            params,
+        ).fetchall()
+        if existing:
+            break
+
+    if not existing:
+        db.execute(
+            '''INSERT INTO transactions
+               (user_id, account_id, category_id, transaction_type, amount, description, payee, date, id_transaction)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (user_id, values['account_id'], values['category_id'], values['transaction_type'], values['amount'],
+             values['description'], values['payee'], values['date'], values['id_transaction']),
+        )
+        return 'inserted'
+
+    keep_id = existing[0]['id']
+    db.execute(
+        '''UPDATE transactions
+           SET account_id = ?, category_id = COALESCE(category_id, ?), amount = ?,
+               description = ?, payee = ?, date = ?, id_transaction = ?
+           WHERE id = ? AND user_id = ?''',
+        (values['account_id'], values['category_id'], values['amount'],
+         values['description'], values['payee'], values['date'], values['id_transaction'], keep_id, user_id),
+    )
+    # Clean up any older duplicates for the same id.
+    for duplicate_row in existing[1:]:
+        db.execute('DELETE FROM transactions WHERE id = ? AND user_id = ?', (duplicate_row['id'], user_id))
+    return 'migrated' if matched_index > 0 else 'updated'
 
 
 def is_transfer_like_category(category_text):
@@ -1566,6 +1739,60 @@ def is_transfer_like_category(category_text):
     return any(token in normalized for token in transfer_tokens)
 
 
+def get_accounts_with_balances(db, user_id):
+    """Accounts with calculated_balance = income - expense of their transactions."""
+    return db.execute('''
+        SELECT a.*,
+            COALESCE(SUM(CASE WHEN t.transaction_type = 'income' THEN t.amount
+                              WHEN t.transaction_type = 'expense' THEN -t.amount
+                              ELSE 0 END), 0) as calculated_balance
+        FROM accounts a
+        LEFT JOIN transactions t ON t.account_id = a.id AND t.user_id = a.user_id
+        WHERE a.user_id = ?
+        GROUP BY a.id
+        ORDER BY a.name
+    ''', (user_id,)).fetchall()
+
+
+def monthly_income_expense(db, user_id, base_currency, start_date=None, month=None):
+    """[{month, income, expenses}] in base currency, oldest first: every month from
+    start_date on, or just `month` (YYYY-MM)."""
+    if month:
+        condition, param = "strftime('%Y-%m', t.date) = ?", month
+    else:
+        condition, param = 't.date >= ?', start_date
+    rows = db.execute(f'''
+        SELECT strftime('%Y-%m', t.date) AS month, t.transaction_type, t.amount, a.currency AS account_currency
+        FROM transactions t
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ? AND t.transaction_type IN ('income', 'expense') AND {condition}
+    ''', (user_id, param)).fetchall()
+
+    totals = {}
+    for row in rows:
+        entry = totals.setdefault(row['month'], {'month': row['month'], 'income': 0.0, 'expenses': 0.0})
+        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
+        entry['income' if row['transaction_type'] == 'income' else 'expenses'] += converted
+    return [totals[key] for key in sorted(totals)]
+
+
+def expense_totals_by_category(db, user_id, base_currency, month):
+    """Expense spending per category for one month (YYYY-MM), largest first."""
+    rows = db.execute('''
+        SELECT c.id, c.name, c.icon, c.color, t.amount, a.currency AS account_currency
+        FROM transactions t
+        JOIN categories c ON t.category_id = c.id AND c.user_id = t.user_id
+        JOIN accounts a ON t.account_id = a.id
+        WHERE t.user_id = ? AND t.transaction_type = 'expense' AND strftime('%Y-%m', t.date) = ?
+    ''', (user_id, month)).fetchall()
+
+    totals = {}
+    for row in rows:
+        entry = totals.setdefault(row['id'], {'name': row['name'], 'icon': row['icon'], 'color': row['color'], 'total': 0.0})
+        entry['total'] += convert_amount(db, row['amount'], row['account_currency'], base_currency)
+    return sorted(totals.values(), key=lambda item: item['total'], reverse=True)
+
+
 def get_account_current_balance(db, user_id, account_id):
     """Compute current balance from account transactions."""
     row = db.execute('''
@@ -1578,11 +1805,39 @@ def get_account_current_balance(db, user_id, account_id):
     return float(row['current_balance']) if row else 0.0
 
 
+class FormInputError(ValueError):
+    """Invalid user input in a posted form; shown as a flash message."""
+
+
+def form_amount(field, label, default=None):
+    """Parse a numeric form field, rejecting text, NaN and infinity."""
+    raw = (request.form.get(field) or '').strip()
+    if not raw:
+        if default is not None:
+            return default
+        raise FormInputError(f'{label} is required.')
+    try:
+        value = parse_amount_string(raw)
+    except ValueError:
+        raise FormInputError(f'{label} must be a number.')
+    if value != value or value in (float('inf'), float('-inf')):
+        raise FormInputError(f'{label} must be a finite number.')
+    return value
+
+
+@app.errorhandler(FormInputError)
+def handle_form_input_error(error):
+    flash(str(error), 'danger')
+    return redirect(request.url)
+
+
 def parse_decimal_field(raw_value, field_name, quantize_to=None):
     try:
         value = Decimal(str(raw_value if raw_value is not None else '0').strip() or '0')
     except (InvalidOperation, ValueError):
         raise ValueError(f'{field_name} must be numeric.')
+    if not value.is_finite():
+        raise ValueError(f'{field_name} must be a finite number.')
 
     if quantize_to is not None:
         value = value.quantize(quantize_to)
@@ -1603,15 +1858,53 @@ def get_holding_value_components(holding):
     return current_value, invested_value
 
 
-def get_holding_base_value(db, user_id, holding, as_of_date=None):
-    params = [user_id, holding['id']]
-    date_filter = ''
-    if as_of_date:
-        date_filter = 'AND valuation_date <= ?'
-        params.append(as_of_date)
+def trade_price_or_current(db, holding, trade_date, trade_price):
+    """Price a holding should carry after a trade: the trade price only when the
+    holding has no price yet or this is its newest trade. Back-dated or imported
+    historical trades must not overwrite a newer market/evolution price."""
+    current = Decimal(str(holding['current_price'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    if current <= 0:
+        return trade_price
+    latest_trade = db.execute(
+        '''SELECT MAX(operation_date) FROM investment_operations
+           WHERE holding_id = ? AND operation_type IN ('buy', 'sell')''',
+        (holding['id'],),
+    ).fetchone()[0]
+    if latest_trade is None or (trade_date or '') >= latest_trade:
+        return trade_price
+    return current
 
-    latest = db.execute(
-        f'''SELECT total_value
+
+def get_net_contributions(db, user_id, holding_id, after_date, until_date=None):
+    """Money put into a holding (deposits + buys - sell proceeds) dated after
+    after_date (exclusive) and up to until_date (inclusive, open-ended if None)."""
+    params = [user_id, holding_id, after_date or '']
+    until_filter = ''
+    if until_date:
+        until_filter = 'AND operation_date <= ?'
+        params.append(until_date)
+    row = db.execute(
+        f'''SELECT COALESCE(SUM(CASE WHEN operation_type IN ('deposit', 'buy') THEN amount
+                                     WHEN operation_type = 'sell' THEN -amount
+                                     ELSE 0 END), 0) AS total
+            FROM investment_operations
+            WHERE user_id = ? AND holding_id = ? AND operation_date > ? {until_filter}''',
+        tuple(params),
+    ).fetchone()
+    return Decimal(str(row['total'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+
+
+def get_latest_valuation(db, user_id, holding_id, on_or_before=None, before=None):
+    params = [user_id, holding_id]
+    date_filter = ''
+    if on_or_before:
+        date_filter = 'AND valuation_date <= ?'
+        params.append(on_or_before)
+    elif before:
+        date_filter = 'AND valuation_date < ?'
+        params.append(before)
+    return db.execute(
+        f'''SELECT valuation_date, total_value
             FROM investment_valuations
             WHERE user_id = ? AND holding_id = ? {date_filter}
             ORDER BY valuation_date DESC, id DESC
@@ -1619,11 +1912,31 @@ def get_holding_base_value(db, user_id, holding, as_of_date=None):
         tuple(params),
     ).fetchone()
 
+
+def get_holding_base_value(db, user_id, holding, as_of_date=None):
+    """Value the holding would have at as_of_date with zero return: the last
+    valuation up to that date plus money contributed since. Without any valuation,
+    the holding's current value."""
+    latest = get_latest_valuation(db, user_id, holding['id'], on_or_before=as_of_date)
     if latest:
-        return Decimal(str(latest['total_value'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+        start = Decimal(str(latest['total_value'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+        contributions = get_net_contributions(db, user_id, holding['id'], latest['valuation_date'], as_of_date)
+        return (start + contributions).quantize(DECIMAL_MONEY_PLACES)
 
     current_value, _ = get_holding_value_components(holding)
     return current_value
+
+
+def get_valuation_tracked_ytd(db, user_id, holding, current_value, year):
+    """Year-to-date return of an evolution-tracked holding (Mintos, fixed income):
+    current value minus (last valuation before this year + contributions since).
+    None when the holding has no valuation before this year."""
+    start = get_latest_valuation(db, user_id, holding['id'], before=f'{year}-01-01')
+    if not start:
+        return None
+    start_value = Decimal(str(start['total_value'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+    contributions = get_net_contributions(db, user_id, holding['id'], start['valuation_date'])
+    return current_value - (start_value + contributions)
 
 
 def get_investment_accounts(db, user_id):
@@ -1665,14 +1978,6 @@ def build_investment_dashboard_data(db, user_id, base_currency):
         (user_id,),
     ).fetchall()
 
-    valuation_rows = db.execute(
-        '''SELECT holding_id, valuation_date, return_amount, currency
-           FROM investment_valuations
-           WHERE user_id = ?
-             AND holding_id IS NOT NULL''',
-        (user_id,),
-    ).fetchall()
-
     all_time_map = defaultdict(float)
     yearly_map = defaultdict(float)
     for op in operation_rows:
@@ -1688,18 +1993,6 @@ def build_investment_dashboard_data(db, user_id, base_currency):
         holding_id = op['holding_id']
         all_time_map[holding_id] += contribution
         if (op['operation_date'] or '')[:4] == current_year:
-            yearly_map[holding_id] += contribution
-
-    for val in valuation_rows:
-        return_amount = val['return_amount']
-        if return_amount is None:
-            continue
-        contribution = convert_amount(db, return_amount, val['currency'], base_currency)
-        if contribution == 0:
-            continue
-        holding_id = val['holding_id']
-        all_time_map[holding_id] += contribution
-        if (val['valuation_date'] or '')[:4] == current_year:
             yearly_map[holding_id] += contribution
 
     for row in holdings:
@@ -1721,32 +2014,41 @@ def build_investment_dashboard_data(db, user_id, base_currency):
         item['current_value_base'] = round(converted_current, 2)
         item['unrealized_gain_base'] = round(converted_current - converted_cost, 2)
 
-        if row['asset_class'] == 'Mintos Lending':
-            total_return_abs_base = converted_current - converted_cost
-        else:
-            total_return_abs_base = item['unrealized_gain_base'] + float(all_time_map[row['id']])
+        # Evolution returns are already inside current value (valuations move the
+        # price), so only cash dividends and realized sells are added on top.
+        total_return_abs_base = item['unrealized_gain_base'] + float(all_time_map[row['id']])
         item['total_return_abs_base'] = round(total_return_abs_base, 2)
         item['total_return_pct'] = round(total_return_abs_base / converted_cost * 100, 6) if converted_cost > 0 else None
 
-        ytd_return_base = float(yearly_map[row['id']])
         created_year = (row['created_at'] or '')[:4]
-        # If a holding was created this year and has no explicit yearly return rows,
-        # use current total return as the YTD proxy.
-        if abs(ytd_return_base) < 1e-12 and created_year == current_year:
-            ytd_return_base = total_return_abs_base
+        if row['asset_class'] in VALUATION_TRACKED_CLASSES:
+            ytd_native = get_valuation_tracked_ytd(db, user_id, row, current_value_dec, current_year)
+            if ytd_native is None:
+                # No valuation before this year: the whole history is this year's.
+                ytd_return_base = total_return_abs_base
+            else:
+                ytd_return_base = convert_amount(db, ytd_native, row['currency'], base_currency) + float(yearly_map[row['id']])
+        else:
+            ytd_return_base = float(yearly_map[row['id']])
+            # If a holding was created this year and has no explicit yearly return rows,
+            # use current total return as the YTD proxy.
+            if abs(ytd_return_base) < 1e-12 and created_year == current_year:
+                ytd_return_base = total_return_abs_base
         item['ytd_return_base'] = round(ytd_return_base, 2)
         item['ytd_return_pct'] = round(ytd_return_base / converted_cost * 100, 6) if converted_cost > 0 else None
         normalized_holdings.append(item)
 
     unrealized_gain = total_portfolio_value - invested_capital
 
-    realized_row = db.execute(
-        '''SELECT COALESCE(SUM(realized_gain), 0) AS realized_gain
-           FROM investment_operations
-           WHERE user_id = ? AND operation_type = 'sell' ''',
-        (user_id,),
-    ).fetchone()
-    realized_gain = float(realized_row['realized_gain']) if realized_row else 0.0
+    realized_gain = sum(
+        convert_amount(db, row['realized_gain'] or 0, row['currency'], base_currency)
+        for row in db.execute(
+            '''SELECT realized_gain, currency
+               FROM investment_operations
+               WHERE user_id = ? AND operation_type = 'sell' ''',
+            (user_id,),
+        ).fetchall()
+    )
 
     current_month = datetime.now().strftime('%Y-%m')
     current_year = datetime.now().strftime('%Y')
@@ -1827,14 +2129,14 @@ def get_account_opening_date(account):
     """Use account creation date for balance adjustment entries."""
     created_at = (account['created_at'] or '').strip()
     if not created_at:
-        return datetime.now().date()
+        return datetime.now().date().isoformat()
 
     # SQLite timestamps are usually YYYY-MM-DD HH:MM:SS.
     date_part = created_at.split(' ')[0]
     try:
-        return datetime.strptime(date_part, '%Y-%m-%d').date()
+        return datetime.strptime(date_part, '%Y-%m-%d').date().isoformat()
     except ValueError:
-        return datetime.now().date()
+        return datetime.now().date().isoformat()
 
 
 def apply_target_balance_adjustment(db, user_id, account, target_balance, current_balance):
@@ -1881,9 +2183,28 @@ def load_user(user_id):
 
 
 # Authentication routes
+def registration_open():
+    if app.config['REGISTRATION_ENABLED']:
+        return True
+    return get_db().execute('SELECT 1 FROM users LIMIT 1').fetchone() is None
+
+
+def safe_next_url(target):
+    """Only allow same-site relative redirects after login."""
+    if not target or not target.startswith('/') or target.startswith('//') or '\\' in target:
+        return None
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc:
+        return None
+    return target
+
+
+app.jinja_env.globals['registration_open'] = registration_open
+
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    if not app.config['REGISTRATION_ENABLED']:
+    if not registration_open():
         flash('Registration is currently disabled.', 'warning')
         return redirect(url_for('login'))
     if current_user.is_authenticated:
@@ -1945,7 +2266,7 @@ def login():
         if user and check_password_hash(user['password_hash'], password):
             user_obj = User(user['id'], user['username'], user['email'])
             login_user(user_obj)
-            next_page = request.args.get('next')
+            next_page = safe_next_url(request.args.get('next'))
             return redirect(next_page or url_for('dashboard'))
 
         flash('Invalid username or password.', 'danger')
@@ -1953,7 +2274,7 @@ def login():
     return render_template('login.html')
 
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 @login_required
 def logout():
     logout_user()
@@ -1964,9 +2285,6 @@ def logout():
 # Main routes
 @app.route('/')
 def index():
-    # In SaaS mode, show landing page for main domain
-    if app.config['SAAS_MODE']:
-        return redirect(url_for('saas.landing'))
     if current_user.is_authenticated:
         return redirect(url_for('dashboard'))
     return redirect(url_for('login'))
@@ -1985,17 +2303,7 @@ def dashboard():
     base_currency = get_user_base_currency(current_user.id)
     ensure_daily_rates(db, base_currency)
 
-    # Get accounts with balances
-    accounts = db.execute('''
-        SELECT a.*,
-            COALESCE(SUM(CASE WHEN t.transaction_type = 'income' THEN t.amount
-                              WHEN t.transaction_type = 'expense' THEN -t.amount
-                              ELSE 0 END), 0) as calculated_balance
-        FROM accounts a
-        LEFT JOIN transactions t ON a.id = t.account_id
-        WHERE a.user_id = ?
-        GROUP BY a.id
-    ''', (current_user.id,)).fetchall()
+    accounts = get_accounts_with_balances(db, current_user.id)
 
     # Calculate total balance in user base currency.
     total_balance = sum(
@@ -2015,59 +2323,15 @@ def dashboard():
         LIMIT 10
     ''', (current_user.id,)).fetchall()
 
-    # Get monthly income and expenses converted to base currency.
     current_month = datetime.now().strftime('%Y-%m')
-    monthly_rows = db.execute('''
-        SELECT t.amount, t.transaction_type, a.currency as account_currency
-        FROM transactions t
-        JOIN accounts a ON t.account_id = a.id
-        WHERE t.user_id = ? AND strftime('%Y-%m', t.date) = ?
-    ''', (current_user.id, current_month)).fetchall()
+    this_month = monthly_income_expense(db, current_user.id, base_currency, month=current_month)
+    monthly_income = this_month[0]['income'] if this_month else 0.0
+    monthly_expenses = this_month[0]['expenses'] if this_month else 0.0
 
-    monthly_income = 0.0
-    monthly_expenses = 0.0
-    for row in monthly_rows:
-        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
-        if row['transaction_type'] == 'income':
-            monthly_income += converted
-        elif row['transaction_type'] == 'expense':
-            monthly_expenses += converted
-
-    # Get spending by category for current month
-    category_rows = db.execute('''
-        SELECT c.id, c.name, c.icon, c.color, t.amount, a.currency as account_currency
-        FROM categories c
-        JOIN transactions t ON c.id = t.category_id
-        JOIN accounts a ON t.account_id = a.id
-        WHERE c.user_id = ?
-          AND c.category_type = 'expense'
-          AND t.user_id = ?
-          AND t.transaction_type = 'expense'
-          AND strftime('%Y-%m', t.date) = ?
-    ''', (current_user.id, current_user.id, current_month)).fetchall()
-
-    category_totals = {}
-    for row in category_rows:
-        cat_id = row['id']
-        if cat_id not in category_totals:
-            category_totals[cat_id] = {
-                'name': row['name'],
-                'icon': row['icon'],
-                'color': row['color'],
-                'total': 0.0,
-            }
-        category_totals[cat_id]['total'] += convert_amount(
-            db,
-            row['amount'],
-            row['account_currency'],
-            base_currency,
-        )
-
-    category_spending = sorted(
-        [value for value in category_totals.values() if value['total'] > 0],
-        key=lambda item: item['total'],
-        reverse=True,
-    )[:5]
+    category_spending = [
+        item for item in expense_totals_by_category(db, current_user.id, base_currency, current_month)
+        if item['total'] > 0
+    ][:5]
 
     return render_template('dashboard.html',
                          accounts=accounts,
@@ -2084,18 +2348,7 @@ def dashboard():
 @login_required
 def accounts():
     db = get_db()
-    accounts = db.execute('''
-        SELECT a.*,
-            COALESCE(SUM(CASE WHEN t.transaction_type = 'income' THEN t.amount
-                              WHEN t.transaction_type = 'expense' THEN -t.amount
-                              ELSE 0 END), 0) as calculated_balance
-        FROM accounts a
-        LEFT JOIN transactions t ON a.id = t.account_id
-        WHERE a.user_id = ?
-        GROUP BY a.id
-        ORDER BY a.name
-    ''', (current_user.id,)).fetchall()
-    return render_template('accounts.html', accounts=accounts)
+    return render_template('accounts.html', accounts=get_accounts_with_balances(db, current_user.id))
 
 
 @app.route('/accounts/add', methods=['GET', 'POST'])
@@ -2104,8 +2357,8 @@ def add_account():
     if request.method == 'POST':
         name = request.form['name'].strip()
         account_type = request.form['account_type']
-        initial_balance = float(request.form.get('initial_balance', 0) or 0)
-        currency = request.form.get('currency', 'USD')
+        initial_balance = form_amount('initial_balance', 'Initial balance', default=0.0)
+        currency = normalize_currency(request.form.get('currency') or get_user_base_currency(current_user.id))
 
         if not name:
             flash('Account name is required.', 'danger')
@@ -2124,7 +2377,7 @@ def add_account():
             db.execute(
                 '''INSERT INTO transactions (user_id, account_id, transaction_type, amount, description, date)
                    VALUES (?, ?, ?, ?, ?, ?)''',
-                (current_user.id, account_id, trans_type, abs(initial_balance), 'Opening Balance', datetime.now().date())
+                (current_user.id, account_id, trans_type, abs(initial_balance), 'Opening Balance', datetime.now().date().isoformat())
             )
 
         db.commit()
@@ -2150,7 +2403,7 @@ def edit_account(account_id):
     if request.method == 'POST':
         name = request.form['name'].strip()
         account_type = request.form['account_type']
-        currency = request.form.get('currency', 'USD')
+        currency = normalize_currency(request.form.get('currency') or get_user_base_currency(current_user.id))
         change_current_balance = request.form.get('change_current_balance') == 'on'
         target_balance_raw = request.form.get('target_current_balance', '').strip()
 
@@ -2195,15 +2448,25 @@ def edit_account(account_id):
     return render_template('account_form.html', account=account, current_balance=current_balance)
 
 
+def delete_account_with_data(db, user_id, account_id):
+    """Delete an account and everything hanging off it (foreign keys are not
+    enforced, so nothing else would clean these rows up)."""
+    holding_ids = [row['id'] for row in db.execute(
+        'SELECT id FROM investment_holdings WHERE user_id = ? AND account_id = ?', (user_id, account_id)
+    )]
+    for holding_id in holding_ids:
+        db.execute('DELETE FROM investment_valuations WHERE user_id = ? AND holding_id = ?', (user_id, holding_id))
+    db.execute('DELETE FROM investment_operations WHERE user_id = ? AND account_id = ?', (user_id, account_id))
+    db.execute('DELETE FROM investment_holdings WHERE user_id = ? AND account_id = ?', (user_id, account_id))
+    db.execute('DELETE FROM transactions WHERE user_id = ? AND account_id = ?', (user_id, account_id))
+    db.execute('DELETE FROM accounts WHERE id = ? AND user_id = ?', (account_id, user_id))
+
+
 @app.route('/accounts/<int:account_id>/delete', methods=['POST'])
 @login_required
 def delete_account(account_id):
     db = get_db()
-    # Delete transactions first
-    db.execute('DELETE FROM transactions WHERE account_id = ? AND user_id = ?',
-               (account_id, current_user.id))
-    db.execute('DELETE FROM accounts WHERE id = ? AND user_id = ?',
-               (account_id, current_user.id))
+    delete_account_with_data(db, current_user.id, account_id)
     db.commit()
     flash('Account deleted.', 'info')
     return redirect(url_for('accounts'))
@@ -2333,14 +2596,7 @@ def delete_investment_account(account_id):
         flash('Delete holdings in this account first.', 'warning')
         return redirect(url_for('investments'))
 
-    db.execute(
-        'DELETE FROM investment_operations WHERE user_id = ? AND account_id = ?',
-        (current_user.id, account_id),
-    )
-    db.execute(
-        'DELETE FROM accounts WHERE id = ? AND user_id = ?',
-        (account_id, current_user.id),
-    )
+    delete_account_with_data(db, current_user.id, account_id)
     db.commit()
     flash('Investment account deleted.', 'info')
     return redirect(url_for('investments'))
@@ -2841,15 +3097,19 @@ def add_investment_operation():
 
             old_qty = Decimal(str(holding['quantity'] or 0)).quantize(DECIMAL_QUANTITY_PLACES)
             old_avg = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
+            # avg_cost/current_price are in the holding's currency; the trade may not be.
+            to_holding_fx = Decimal(str(convert_amount(db, 1, currency, holding['currency'])))
+            price_in_holding_ccy = (price_per_unit * to_holding_fx).quantize(DECIMAL_MONEY_PLACES)
+            new_price = trade_price_or_current(db, holding, operation_date, price_in_holding_ccy)
 
             if operation_type == 'buy':
                 new_qty = (old_qty + quantity).quantize(DECIMAL_QUANTITY_PLACES)
-                new_avg = (((old_qty * old_avg) + (quantity * price_per_unit)) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
+                new_avg = (((old_qty * old_avg) + (quantity * price_in_holding_ccy)) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
                 db.execute(
                     '''UPDATE investment_holdings
                        SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
                        WHERE id = ? AND user_id = ?''',
-                    (float(new_qty), float(new_avg), float(price_per_unit), holding['id'], current_user.id),
+                    (float(new_qty), float(new_avg), float(new_price), holding['id'], current_user.id),
                 )
             else:
                 if quantity - old_qty > FRACTIONAL_TOLERANCE:
@@ -2864,12 +3124,14 @@ def add_investment_operation():
                 if abs(new_qty) <= FRACTIONAL_TOLERANCE:
                     new_qty = Decimal('0')
                 new_qty = new_qty.quantize(DECIMAL_QUANTITY_PLACES)
-                realized_gain = ((price_per_unit - old_avg) * quantity).quantize(DECIMAL_MONEY_PLACES)
+                # Stored in the operation's currency, like the operation amount.
+                old_avg_in_trade_ccy = old_avg / to_holding_fx if to_holding_fx else old_avg
+                realized_gain = ((price_per_unit - old_avg_in_trade_ccy) * quantity).quantize(DECIMAL_MONEY_PLACES)
                 db.execute(
                     '''UPDATE investment_holdings
                        SET quantity = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
                        WHERE id = ? AND user_id = ?''',
-                    (float(new_qty), float(price_per_unit), holding['id'], current_user.id),
+                    (float(new_qty), float(new_price), holding['id'], current_user.id),
                 )
 
         elif operation_type == 'dividend':
@@ -3030,12 +3292,11 @@ def add_investment_snapshot():
     return redirect(url_for('investments'))
 
 
-def apply_mintos_evolution(db, user_id, holding, valuation_date, total_value, note='', id_transaction=None, base_value=None):
+def apply_mintos_evolution(db, user_id, holding, valuation_date, total_value, note='', base_value=None):
     """Set a Mintos Lending holding's current total value at a date: record a
-    valuation and book the change vs the prior value as a 'dividend' return.
-    Shared by the manual evolution route and the statement importer; the importer
-    passes an explicit base_value (cost basis + already-booked returns) so repeated
-    imports converge instead of double-counting."""
+    valuation whose return_amount is the change vs the base value (the previous
+    valuation plus deposits since). Shared by the manual evolution route and the
+    statement importer."""
     if base_value is None:
         base_value = get_holding_base_value(db, user_id, holding, valuation_date)
     total_value = total_value.quantize(DECIMAL_MONEY_PLACES)
@@ -3065,22 +3326,6 @@ def apply_mintos_evolution(db, user_id, holding, valuation_date, total_value, no
            WHERE id = ? AND user_id = ?''',
         (float(total_value), holding['id'], user_id),
     )
-    if return_amount != 0:
-        db.execute(
-            '''INSERT INTO investment_operations
-               (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date, id_transaction)
-               VALUES (?, ?, ?, 'dividend', ?, ?, 0, ?, ?, ?)''',
-            (
-                user_id,
-                holding['account_id'],
-                holding['id'],
-                float(return_amount),
-                holding['currency'],
-                f'Auto return from valuation. {note}'.strip(),
-                valuation_date,
-                id_transaction,
-            ),
-        )
     return {'total_value': total_value, 'return_amount': return_amount, 'return_pct': return_pct}
 
 
@@ -3184,28 +3429,15 @@ def add_investment_evolution():
         (float(quantity_to_store), float(new_price), holding['id'], current_user.id),
     )
 
-    if computed_return_amount is not None and computed_return_amount != 0:
-        db.execute(
-            '''INSERT INTO investment_operations
-               (user_id, account_id, holding_id, operation_type, amount, currency, is_reinvested, note, operation_date)
-               VALUES (?, ?, ?, 'dividend', ?, ?, 0, ?, ?)''',
-            (
-                current_user.id,
-                holding['account_id'],
-                holding['id'],
-                float(computed_return_amount),
-                holding['currency'],
-                f'Auto return from valuation. {note}'.strip(),
-                valuation_date,
-            ),
-        )
-
     db.commit()
     flash('Evolution recorded and returns auto-computed.', 'success')
     return redirect(url_for('investments'))
 
 
 # Transaction routes
+TRANSACTIONS_PER_PAGE = 100
+
+
 @app.route('/transactions')
 @login_required
 def transactions():
@@ -3248,7 +3480,12 @@ def transactions():
         query += ' AND (t.description LIKE ? OR t.payee LIKE ?)'
         params.extend([f'%{search}%', f'%{search}%'])
 
-    query += ' ORDER BY t.date DESC, t.id DESC'
+    total_count = db.execute(f'SELECT COUNT(*) FROM ({query})', params).fetchone()[0]
+    page_count = max(1, -(-total_count // TRANSACTIONS_PER_PAGE))
+    page = min(max(request.args.get('page', 1, type=int), 1), page_count)
+
+    query += ' ORDER BY t.date DESC, t.id DESC LIMIT ? OFFSET ?'
+    params.extend([TRANSACTIONS_PER_PAGE, (page - 1) * TRANSACTIONS_PER_PAGE])
 
     transactions = db.execute(query, params).fetchall()
     accounts = db.execute('SELECT * FROM accounts WHERE user_id = ? ORDER BY name',
@@ -3260,6 +3497,9 @@ def transactions():
                          transactions=transactions,
                          accounts=accounts,
                          categories=categories,
+                         page=page,
+                         page_count=page_count,
+                         total_count=total_count,
                          filters={
                              'account_id': account_id,
                              'category_id': category_id,
@@ -3279,7 +3519,7 @@ def add_transaction():
         account_id = request.form['account_id']
         category_id = request.form.get('category_id') or None
         trans_type = request.form['transaction_type']
-        amount = float(request.form['amount'])
+        amount = form_amount('amount', 'Amount')
         description = request.form.get('description', '').strip()
         payee = request.form.get('payee', '').strip()
         date = request.form['date']
@@ -3320,7 +3560,7 @@ def edit_transaction(transaction_id):
         account_id = request.form['account_id']
         category_id = request.form.get('category_id') or None
         trans_type = request.form['transaction_type']
-        amount = float(request.form['amount'])
+        amount = form_amount('amount', 'Amount')
         description = request.form.get('description', '').strip()
         payee = request.form.get('payee', '').strip()
         date = request.form['date']
@@ -3707,11 +3947,12 @@ def _parse_edenred_format_a(rows, product_token):
             continue
 
         detail = str(detail or '').strip()
-        # Edenred amounts are unsigned: RECARGA rows are top-ups, the rest is spending.
+        # Edenred amounts are charges: RECARGA rows are top-ups, the rest is
+        # spending (positive) or a refund (negative charge -> money back in).
         is_topup = detail.strip().upper() == 'RECARGA'
-        transaction_type = 'income' if is_topup else 'expense'
         if not is_topup:
             amount = -amount
+        transaction_type = 'income' if amount >= 0 else 'expense'
 
         key = (product_token, timestamp, detail, str(abs(amount)))
         occurrences[key] += 1
@@ -4010,7 +4251,10 @@ def build_mintos_import_plan(db, user_id, account_id, holding_id, create_holding
             'row_count': sum(parsed['bucket_counts'].values()),
             'deposits': len(parsed['deposits']),
         })
-        latest = parsed  # files are sorted ascending: the last one is authoritative
+        # The statement reaching the latest date is authoritative (file names are
+        # DD_MM_YYYY, so name order is not date order).
+        if latest is None or parsed['statement_end_date'] >= latest['statement_end_date']:
+            latest = parsed
         if parsed['date_from'] and (earliest_from is None or parsed['date_from'] < earliest_from):
             earliest_from = parsed['date_from']
 
@@ -4069,7 +4313,7 @@ def build_mintos_import_plan(db, user_id, account_id, holding_id, create_holding
 def import_mintos_statement(db, user_id, holding, plan):
     """Apply new deposits to the cost basis, then set the current total value via
     an evolution valuation. Idempotent: deposits are keyed by id_transaction and
-    the booked gain self-corrects against already-booked returns."""
+    a statement already booked at the same date and value is left unchanged."""
     existing_ids = {
         row['id_transaction'] for row in db.execute(
             'SELECT id_transaction FROM investment_operations WHERE user_id = ? AND id_transaction IS NOT NULL',
@@ -4113,15 +4357,6 @@ def import_mintos_statement(db, user_id, holding, plan):
     target_value = plan['current_total_value']
     valuation_date = plan['statement_end_date']
     if target_value and valuation_date:
-        booked = db.execute(
-            '''SELECT COALESCE(SUM(amount), 0) AS total FROM investment_operations
-               WHERE user_id = ? AND holding_id = ? AND operation_type = 'dividend' ''',
-            (user_id, holding['id']),
-        ).fetchone()['total']
-        already_booked = Decimal(str(booked or 0)).quantize(DECIMAL_MONEY_PLACES)
-        # base = cost basis + returns already booked => gain self-corrects on re-import.
-        base_value = (Decimal(str(holding['avg_cost'] or 0)) + already_booked).quantize(DECIMAL_MONEY_PLACES)
-
         existing_val = db.execute(
             'SELECT id, total_value FROM investment_valuations WHERE user_id = ? AND holding_id = ? AND valuation_date = ?',
             (user_id, holding['id'], valuation_date),
@@ -4134,9 +4369,11 @@ def import_mintos_statement(db, user_id, holding, plan):
                 valuation_action = 'updated'
             else:
                 valuation_action = 'created'
+            # Base = previous valuation + deposits since (including the ones just
+            # added), computed after dropping a superseded same-date valuation.
             apply_mintos_evolution(
                 db, user_id, holding, valuation_date, target_value,
-                note='Imported from Mintos statement', base_value=base_value,
+                note='Imported from Mintos statement',
             )
 
     return {'deposits_created': deposits_created, 'valuation_action': valuation_action}
@@ -4381,23 +4618,17 @@ def upsert_bank_transactions(db, user_id, prepared_rows):
         (user_id,),
     ).fetchall()
     categories_by_id = {cat['id']: cat for cat in categories}
+    rules = load_category_rules(db, user_id)
 
-    imported = 0
-    updated = 0
-    migrated = 0
+    counts = {'inserted': 0, 'updated': 0, 'migrated': 0}
     errors = []
 
     for row in prepared_rows:
         try:
             category_text = row['category_text']
-            matched_category_id = auto_categorize_transaction(
-                user_id, row['description'], row['payee'] or category_text
+            matched_category_id = match_import_category(
+                user_id, rules, categories, row['description'], row['payee'], category_text
             )
-            if not matched_category_id and category_text:
-                for cat in categories:
-                    if cat['name'].lower() in category_text.lower() or category_text.lower() in cat['name'].lower():
-                        matched_category_id = cat['id']
-                        break
 
             transaction_type = row['transaction_type']
             matched_category = categories_by_id.get(matched_category_id)
@@ -4409,73 +4640,27 @@ def upsert_bank_transactions(db, user_id, prepared_rows):
             ):
                 transaction_type = 'transfer'
 
-            amount = float(abs(row['amount']))
-
-            existing = db.execute(
-                'SELECT id FROM transactions WHERE user_id = ? AND id_transaction = ? ORDER BY id DESC',
-                (user_id, row['id_transaction']),
-            ).fetchall()
-            is_migration = False
-            if not existing and row.get('legacy_id'):
-                existing = db.execute(
-                    'SELECT id FROM transactions WHERE user_id = ? AND id_transaction = ? ORDER BY id DESC',
-                    (user_id, row['legacy_id']),
-                ).fetchall()
-                is_migration = bool(existing)
-
-            if existing:
-                keep_id = existing[0]['id']
-                db.execute(
-                    '''UPDATE transactions
-                       SET account_id = ?, category_id = ?, transaction_type = ?, amount = ?,
-                           description = ?, payee = ?, date = ?, id_transaction = ?
-                       WHERE id = ? AND user_id = ?''',
-                    (
-                        row['account_id'],
-                        matched_category_id,
-                        transaction_type,
-                        amount,
-                        row['description'],
-                        row['payee'],
-                        row['date'],
-                        row['id_transaction'],
-                        keep_id,
-                        user_id,
-                    ),
-                )
-                # Clean up any older duplicates for the same id_transaction.
-                for duplicate_row in existing[1:]:
-                    db.execute(
-                        'DELETE FROM transactions WHERE id = ? AND user_id = ?',
-                        (duplicate_row['id'], user_id),
-                    )
-                if is_migration:
-                    migrated += 1
-                else:
-                    updated += 1
-            else:
-                db.execute(
-                    '''INSERT INTO transactions
-                       (user_id, account_id, category_id, transaction_type, amount,
-                        description, payee, date, id_transaction)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                    (
-                        user_id,
-                        row['account_id'],
-                        matched_category_id,
-                        transaction_type,
-                        amount,
-                        row['description'],
-                        row['payee'],
-                        row['date'],
-                        row['id_transaction'],
-                    ),
-                )
-                imported += 1
+            outcome = upsert_transaction_by_external_id(
+                db, user_id,
+                {
+                    'account_id': row['account_id'],
+                    'category_id': matched_category_id,
+                    'transaction_type': transaction_type,
+                    'amount': float(abs(row['amount'])),
+                    'description': row['description'],
+                    'payee': row['payee'],
+                    'date': row['date'],
+                    'id_transaction': row['id_transaction'],
+                },
+                # User-wide match: remapping a currency to another account moves
+                # rows instead of duplicating them; legacy ids migrate in place.
+                [row['id_transaction'], row.get('legacy_id')],
+            )
+            counts[outcome] += 1
         except Exception as exc:
             errors.append(f"{row.get('id_transaction', '?')}: {exc}")
 
-    return imported, updated, migrated, errors
+    return counts['inserted'], counts['updated'], counts['migrated'], errors
 
 
 def import_tr_investment_ops(db, user_id, investment_account_id, investment_rows):
@@ -4535,11 +4720,12 @@ def import_tr_investment_ops(db, user_id, investment_account_id, investment_rows
         old_avg = Decimal(str(holding['avg_cost'] or 0)).quantize(DECIMAL_MONEY_PLACES)
         new_qty = (old_qty + quantity).quantize(DECIMAL_QUANTITY_PLACES)
         new_avg = (((old_qty * old_avg) + (quantity * price)) / new_qty).quantize(DECIMAL_MONEY_PLACES) if new_qty > 0 else Decimal('0')
+        new_price = trade_price_or_current(db, holding, row['date'], price)
         db.execute(
             '''UPDATE investment_holdings
                SET quantity = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND user_id = ?''',
-            (float(new_qty), float(new_avg), float(price), holding['id'], user_id),
+            (float(new_qty), float(new_avg), float(new_price), holding['id'], user_id),
         )
         db.execute(
             '''INSERT INTO investment_operations
@@ -4981,6 +5167,19 @@ def mintos_import_confirm():
     return redirect(url_for('investments'))
 
 
+CSV_IMPORT_COLUMNS = ('ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION', 'PAYEE', 'TRANSACTION_TYPE')
+# Column order of a header-less file (the original 5-column format).
+CSV_IMPORT_POSITIONAL = {'ID_TRANSACTION': 0, 'DATE': 1, 'AMOUNT': 2, 'CATEGORY': 3, 'DESCRIPTION': 4}
+
+
+def decode_uploaded_text(raw):
+    """Bank exports are UTF-8 (often with a BOM) or Windows-1252."""
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode('cp1252')
+
+
 @app.route('/import', methods=['GET', 'POST'])
 @login_required
 def import_csv():
@@ -4989,236 +5188,137 @@ def import_csv():
                          (current_user.id,)).fetchall()
     categories = db.execute('SELECT * FROM categories WHERE user_id = ? ORDER BY category_type, name',
                            (current_user.id,)).fetchall()
-    categories_by_id = {str(cat['id']): cat for cat in categories}
+    categories_by_id = {cat['id']: cat for cat in categories}
 
     if request.method == 'POST':
-        if 'file' not in request.files:
+        file = request.files.get('file')
+        if not file or not file.filename:
             flash('No file selected.', 'danger')
             return redirect(url_for('import_csv'))
 
-        file = request.files['file']
-        if file.filename == '':
-            flash('No file selected.', 'danger')
-            return redirect(url_for('import_csv'))
-
-        if not file.filename.endswith('.csv'):
+        if not file.filename.lower().endswith('.csv'):
             flash('Please upload a CSV file.', 'danger')
             return redirect(url_for('import_csv'))
 
-        account_id = request.form.get('account_id')
-        if not account_id:
+        account = next((acc for acc in accounts if str(acc['id']) == request.form.get('account_id')), None)
+        if not account:
             flash('Please select an account.', 'danger')
             return redirect(url_for('import_csv'))
 
-        default_category_id = request.form.get('default_category_id') or None
+        default_category_id = request.form.get('default_category_id', type=int)
+        if default_category_id not in categories_by_id:
+            default_category_id = None
         skip_first_row = request.form.get('skip_header') == 'on'
 
         try:
-            # Read and decode CSV file
-            content = file.read().decode('utf-8')
-            csv_file = io.StringIO(content)
-
-            # Try to detect delimiter
-            sample = content[:2000]
-            if '\t' in sample:
-                delimiter = '\t'
-            elif ';' in sample:
-                delimiter = ';'
-            else:
-                delimiter = ','
-
-            reader = csv.reader(csv_file, delimiter=delimiter)
-
-            imported_count = 0
-            updated_count = 0
-            skipped_count = 0
-            errors = []
-            expected_headers = ['ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION']
-
-            for row_num, row in enumerate(reader, 1):
-                # Skip header row if requested
-                if skip_first_row and row_num == 1:
-                    normalized_header = [col.strip().lstrip('\ufeff').upper() for col in row[:5]]
-                    if len(row) < 5 or normalized_header != expected_headers:
-                        flash(
-                            'Invalid CSV header. Expected: ID_TRANSACTION,DATE,AMOUNT,CATEGORY,DESCRIPTION',
-                            'danger'
-                        )
-                        return redirect(url_for('import_csv'))
-                    continue
-
-                if len(row) < 5:
-                    skipped_count += 1
-                    continue
-
-                try:
-                    # Parse CSV columns: ID_TRANSACTION, DATE, AMOUNT, CATEGORY, DESCRIPTION
-                    id_transaction = row[0].strip() or None
-                    date_str = row[1].strip()
-                    amount_str = row[2].strip()
-                    category_csv = row[3].strip()
-                    description = row[4].strip()
-
-                    # Parse date (YYYY-MM-DD format)
-                    try:
-                        parsed_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    except ValueError:
-                        errors.append(f"Row {row_num}: Invalid date format '{date_str}'. Expected YYYY-MM-DD")
-                        skipped_count += 1
-                        continue
-
-                    # Parse amount (handle various number formats)
-                    amount_str = amount_str.replace('"', '').replace(' ', '')
-
-                    # Detect format based on position of comma and dot
-                    if ',' in amount_str and '.' in amount_str:
-                        # Find last occurrence of each
-                        last_comma = amount_str.rfind(',')
-                        last_dot = amount_str.rfind('.')
-
-                        if last_comma > last_dot:
-                            # European format: 1.234,56 -> comma is decimal separator
-                            amount_str = amount_str.replace('.', '').replace(',', '.')
-                        else:
-                            # US format: 1,234.56 -> dot is decimal separator
-                            amount_str = amount_str.replace(',', '')
-                    elif ',' in amount_str:
-                        # Only comma - could be decimal (European) or thousands (US with no decimals)
-                        # If comma is followed by exactly 2 digits at end, treat as decimal
-                        if re.search(r',\d{2}$', amount_str):
-                            amount_str = amount_str.replace(',', '.')
-                        else:
-                            # Assume thousands separator
-                            amount_str = amount_str.replace(',', '')
-
-                    amount = float(amount_str)
-
-                    # Determine transaction type based on amount
-                    if amount >= 0:
-                        trans_type = 'income'
-                    else:
-                        trans_type = 'expense'
-                        amount = abs(amount)
-
-                    # Try to auto-categorize using rules first
-                    matched_category_id = auto_categorize_transaction(current_user.id, description, category_csv)
-
-                    # If no rule matched, try to match category from CSV to existing categories
-                    if not matched_category_id and category_csv:
-                        for cat in categories:
-                            if cat['name'].lower() in category_csv.lower() or category_csv.lower() in cat['name'].lower():
-                                matched_category_id = cat['id']
-                                break
-
-                    # Fall back to default category if still not matched
-                    if not matched_category_id:
-                        matched_category_id = default_category_id
-
-                    matched_category = categories_by_id.get(str(matched_category_id)) if matched_category_id else None
-
-                    # Transfer categories should be imported as transfer regardless of amount sign.
-                    if (matched_category and matched_category['category_type'] == 'transfer') or is_transfer_like_category(category_csv):
-                        trans_type = 'transfer'
-
-                    # Upsert by id_transaction when provided: newest import replaces existing data.
-                    if id_transaction:
-                        existing_matches = db.execute(
-                            '''SELECT id FROM transactions
-                               WHERE user_id = ? AND account_id = ? AND id_transaction = ?
-                               ORDER BY id DESC''',
-                            (current_user.id, account_id, id_transaction)
-                        ).fetchall()
-
-                        if existing_matches:
-                            keep_id = existing_matches[0]['id']
-                            db.execute(
-                                '''UPDATE transactions
-                                   SET category_id = ?, transaction_type = ?, amount = ?,
-                                       description = ?, payee = ?, date = ?
-                                   WHERE id = ? AND user_id = ?''',
-                                (
-                                    matched_category_id,
-                                    trans_type,
-                                    amount,
-                                    description,
-                                    category_csv,
-                                    parsed_date,
-                                    keep_id,
-                                    current_user.id,
-                                )
-                            )
-
-                            # Clean up any older duplicates for the same id_transaction.
-                            for duplicate_row in existing_matches[1:]:
-                                db.execute(
-                                    'DELETE FROM transactions WHERE id = ? AND user_id = ?',
-                                    (duplicate_row['id'], current_user.id)
-                                )
-                            updated_count += 1
-                        else:
-                            db.execute(
-                                '''INSERT INTO transactions
-                                   (user_id, account_id, category_id, transaction_type, amount,
-                                    description, payee, date, id_transaction)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                (
-                                    current_user.id,
-                                    account_id,
-                                    matched_category_id,
-                                    trans_type,
-                                    amount,
-                                    description,
-                                    category_csv,
-                                    parsed_date,
-                                    id_transaction,
-                                )
-                            )
-                            imported_count += 1
-                    else:
-                        db.execute(
-                            '''INSERT INTO transactions
-                               (user_id, account_id, category_id, transaction_type, amount, description, payee, date)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                            (
-                                current_user.id,
-                                account_id,
-                                matched_category_id,
-                                trans_type,
-                                amount,
-                                description,
-                                category_csv,
-                                parsed_date,
-                            )
-                        )
-                        imported_count += 1
-
-                except Exception as e:
-                    errors.append(f"Row {row_num}: {str(e)}")
-                    skipped_count += 1
-                    continue
-
-            db.commit()
-
-            if imported_count > 0 or updated_count > 0:
-                flash(
-                    f'Successfully imported {imported_count} new transactions and updated {updated_count} existing transactions.',
-                    'success'
-                )
-            if skipped_count > 0:
-                flash(f'Skipped {skipped_count} rows.', 'warning')
-            if errors and len(errors) <= 5:
-                for error in errors:
-                    flash(error, 'danger')
-            elif errors:
-                flash(f'There were {len(errors)} errors during import.', 'danger')
-
-            return redirect(url_for('transactions'))
-
+            content = decode_uploaded_text(file.read())
+            rows = list(csv.reader(io.StringIO(content), delimiter=detect_delimiter(content[:2000])))
         except Exception as e:
-            flash(f'Error reading CSV file: {str(e)}', 'danger')
+            flash(f'Error reading CSV file: {e}', 'danger')
             return redirect(url_for('import_csv'))
 
-    return render_template('import.html', accounts=accounts, categories=categories)
+        columns = CSV_IMPORT_POSITIONAL
+        first_row_num = 1
+        if skip_first_row and rows:
+            header = [col.strip().lstrip('﻿').upper() for col in rows[0]]
+            if not {'DATE', 'AMOUNT'} <= set(header):
+                flash(
+                    'Invalid CSV header. Expected DATE and AMOUNT columns, optionally with '
+                    'ID_TRANSACTION, CATEGORY, DESCRIPTION, PAYEE and TRANSACTION_TYPE.',
+                    'danger'
+                )
+                return redirect(url_for('import_csv'))
+            columns = {name: header.index(name) for name in CSV_IMPORT_COLUMNS if name in header}
+            rows = rows[1:]
+            first_row_num = 2
+
+        set_user_setting(db, current_user.id, 'csv_import_account_id', account['id'])
+        rules = load_category_rules(db, current_user.id)
+        counts = {'inserted': 0, 'updated': 0}
+        skipped_count = 0
+        errors = []
+        occurrences = defaultdict(int)
+
+        for row_num, row in enumerate(rows, first_row_num):
+            def cell(name):
+                index = columns.get(name)
+                return row[index].strip() if index is not None and index < len(row) else ''
+
+            if not any(value.strip() for value in row):
+                continue
+            try:
+                date_value = parse_import_date(cell('DATE'))
+                amount = parse_amount_string(cell('AMOUNT'))
+            except ValueError as exc:
+                errors.append(f'Row {row_num}: {exc}')
+                skipped_count += 1
+                continue
+
+            description = cell('DESCRIPTION')
+            payee = cell('PAYEE')
+            category_csv = cell('CATEGORY')
+            trans_type = cell('TRANSACTION_TYPE').lower()
+            if trans_type not in ('income', 'expense', 'transfer'):
+                trans_type = 'income' if amount >= 0 else 'expense'
+
+            matched_category_id = match_import_category(
+                current_user.id, rules, categories, description, payee, category_csv
+            ) or default_category_id
+            matched_category = categories_by_id.get(matched_category_id)
+            # Transfer categories should be imported as transfer regardless of amount sign.
+            if (matched_category and matched_category['category_type'] == 'transfer') or is_transfer_like_category(category_csv):
+                trans_type = 'transfer'
+
+            id_transaction = cell('ID_TRANSACTION')
+            if not id_transaction:
+                # Stable id from the row content so re-importing the file updates
+                # instead of duplicating (occurrence index keeps identical rows apart).
+                key = (account['id'], date_value, f'{amount:.2f}', description, payee)
+                occurrences[key] += 1
+                id_transaction = synthetic_bank_id('csv', *key, occurrences[key])
+
+            try:
+                outcome = upsert_transaction_by_external_id(
+                    db, current_user.id,
+                    {
+                        'account_id': account['id'],
+                        'category_id': matched_category_id,
+                        'transaction_type': trans_type,
+                        'amount': abs(amount),
+                        'description': description,
+                        'payee': payee,
+                        'date': date_value,
+                        'id_transaction': id_transaction,
+                    },
+                    [id_transaction],
+                    account_scope=account['id'],
+                )
+                counts[outcome] += 1
+            except Exception as e:
+                errors.append(f"Row {row_num}: {e}")
+                skipped_count += 1
+
+        db.commit()
+
+        if counts['inserted'] or counts['updated']:
+            flash(
+                f"Successfully imported {counts['inserted']} new transactions and updated {counts['updated']} existing transactions.",
+                'success'
+            )
+        if skipped_count > 0:
+            flash(f'Skipped {skipped_count} rows.', 'warning')
+        if errors and len(errors) <= 5:
+            for error in errors:
+                flash(error, 'danger')
+        elif errors:
+            flash(f'There were {len(errors)} errors during import.', 'danger')
+
+        return redirect(url_for('transactions'))
+
+    return render_template(
+        'import.html', accounts=accounts, categories=categories,
+        last_account_id=get_user_setting(db, current_user.id, 'csv_import_account_id'),
+    )
 
 
 @app.route('/export/transactions')
@@ -5235,19 +5335,8 @@ def export_transactions():
     }
 
     rows = fetch_transactions_export_rows(db, current_user.id, filters)
-    headers = [
-        'ID_TRANSACTION',
-        'DATE',
-        'AMOUNT',
-        'CATEGORY',
-        'DESCRIPTION',
-        'PAYEE',
-        'ACCOUNT_NAME',
-        'ACCOUNT_CURRENCY',
-        'TRANSACTION_TYPE',
-    ]
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    payload = rows_to_csv_bytes(headers, rows)
+    payload = rows_to_csv_bytes(TRANSACTION_EXPORT_HEADERS, rows)
     return send_file(
         io.BytesIO(payload),
         mimetype='text/csv',
@@ -5302,10 +5391,6 @@ def export_full_zip():
     headers_accounts = ['ACCOUNT_NAME', 'ACCOUNT_TYPE', 'CURRENCY', 'CURRENT_BALANCE', 'CREATED_AT']
     headers_categories = ['NAME', 'CATEGORY_TYPE', 'ICON', 'COLOR']
     headers_rules = ['PATTERN', 'CATEGORY_NAME', 'CATEGORY_TYPE', 'MATCH_FIELD', 'IS_REGEX', 'PRIORITY']
-    headers_transactions = [
-        'ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION',
-        'PAYEE', 'ACCOUNT_NAME', 'ACCOUNT_CURRENCY', 'TRANSACTION_TYPE'
-    ]
 
     package_bytes = io.BytesIO()
     with zipfile.ZipFile(package_bytes, mode='w', compression=zipfile.ZIP_DEFLATED) as archive:
@@ -5321,7 +5406,7 @@ def export_full_zip():
             slug = slugify_filename(account_name)
             archive.writestr(
                 f'transactions_{slug}.csv',
-                rows_to_csv_bytes(headers_transactions, rows),
+                rows_to_csv_bytes(TRANSACTION_EXPORT_HEADERS, rows),
             )
 
         manifest = {
@@ -5343,6 +5428,31 @@ def export_full_zip():
         mimetype='application/zip',
         as_attachment=True,
         download_name=f'financetracker_backup_{timestamp}.zip',
+    )
+
+
+@app.route('/export/database')
+@login_required
+def export_database():
+    """Lossless backup: a consistent snapshot of the whole SQLite database
+    (investments, budgets, settings and all). Restore by replacing finance.db."""
+    db = get_db()
+    if db.execute('SELECT COUNT(*) FROM users').fetchone()[0] > 1:
+        flash('The database backup contains every user, so it is only available while you are the only user.', 'warning')
+        return redirect(url_for('options'))
+
+    snapshot = sqlite3.connect(':memory:')
+    try:
+        db.backup(snapshot)
+        payload = snapshot.serialize()
+    finally:
+        snapshot.close()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return send_file(
+        io.BytesIO(payload),
+        mimetype='application/vnd.sqlite3',
+        as_attachment=True,
+        download_name=f'finance_{timestamp}.db',
     )
 
 
@@ -5386,11 +5496,7 @@ def export_full_xlsx():
     write_sheet('Accounts', ['ACCOUNT_NAME', 'ACCOUNT_TYPE', 'CURRENCY', 'CURRENT_BALANCE', 'CREATED_AT'], account_rows)
     write_sheet('Categories', ['NAME', 'CATEGORY_TYPE', 'ICON', 'COLOR'], category_rows)
     write_sheet('Rules', ['PATTERN', 'CATEGORY_NAME', 'CATEGORY_TYPE', 'MATCH_FIELD', 'IS_REGEX', 'PRIORITY'], rule_rows)
-    write_sheet(
-        'Transactions',
-        ['ID_TRANSACTION', 'DATE', 'AMOUNT', 'CATEGORY', 'DESCRIPTION', 'PAYEE', 'ACCOUNT_NAME', 'ACCOUNT_CURRENCY', 'TRANSACTION_TYPE'],
-        tx_rows,
-    )
+    write_sheet('Transactions', TRANSACTION_EXPORT_HEADERS, tx_rows)
 
     output = io.BytesIO()
     workbook.save(output)
@@ -5487,6 +5593,9 @@ def import_full_package():
     try:
         if filename.endswith('.zip'):
             package = zipfile.ZipFile(io.BytesIO(file.read()))
+            members = package.infolist()
+            if len(members) > BACKUP_MAX_MEMBERS or any(m.file_size > BACKUP_MAX_MEMBER_BYTES for m in members):
+                raise ValueError('Backup package is too large.')
 
             if 'accounts.csv' in package.namelist():
                 account_rows = csv_text_to_dict_rows(package.read('accounts.csv').decode('utf-8'))
@@ -5564,7 +5673,7 @@ def add_category():
         name = request.form['name'].strip()
         category_type = request.form['category_type']
         icon = request.form.get('icon', '📁').strip() or '📁'
-        color = request.form.get('color', '#6c757d')
+        color = normalize_category_color(request.form.get('color'))
 
         if not name:
             flash('Category name is required.', 'danger')
@@ -5597,7 +5706,7 @@ def edit_category(category_id):
         name = request.form['name'].strip()
         category_type = request.form['category_type']
         icon = request.form.get('icon', '📁').strip() or '📁'
-        color = request.form.get('color', '#6c757d')
+        color = normalize_category_color(request.form.get('color'))
 
         if not name:
             flash('Category name is required.', 'danger')
@@ -5621,6 +5730,11 @@ def delete_category(category_id):
     # Set category_id to NULL for transactions using this category
     db.execute('UPDATE transactions SET category_id = NULL WHERE category_id = ? AND user_id = ?',
                (category_id, current_user.id))
+    # Rules and budgets are meaningless without their category.
+    db.execute('DELETE FROM category_rules WHERE category_id = ? AND user_id = ?',
+               (category_id, current_user.id))
+    db.execute('DELETE FROM budgets WHERE category_id = ? AND user_id = ?',
+               (category_id, current_user.id))
     db.execute('DELETE FROM categories WHERE id = ? AND user_id = ?',
                (category_id, current_user.id))
     db.commit()
@@ -5643,25 +5757,47 @@ def category_rules():
     return render_template('rules.html', rules=rules)
 
 
+def parse_rule_form(db):
+    """Validate the add/edit rule form. Returns (fields, error_message)."""
+    pattern = (request.form.get('pattern') or '').strip()
+    category_id = request.form.get('category_id', type=int)
+    is_regex = 1 if request.form.get('is_regex') == 'on' else 0
+    match_field = 'payee' if request.form.get('match_field') == 'payee' else 'description'
+    if not pattern or not category_id:
+        return None, 'Pattern and category are required.'
+    if not db.execute('SELECT 1 FROM categories WHERE id = ? AND user_id = ?',
+                      (category_id, current_user.id)).fetchone():
+        return None, 'Invalid category selected.'
+    try:
+        priority = int(request.form.get('priority') or 0)
+    except ValueError:
+        return None, 'Priority must be a whole number.'
+    if is_regex:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            return None, f'Invalid regular expression: {exc}'
+    return {
+        'pattern': pattern, 'category_id': category_id, 'match_field': match_field,
+        'is_regex': is_regex, 'priority': priority,
+    }, None
+
+
 @app.route('/rules/add', methods=['GET', 'POST'])
 @login_required
 def add_rule():
     db = get_db()
 
     if request.method == 'POST':
-        pattern = request.form['pattern'].strip()
-        category_id = request.form['category_id']
-        match_field = request.form.get('match_field', 'description')
-        is_regex = 1 if request.form.get('is_regex') == 'on' else 0
-        priority = int(request.form.get('priority', 0))
-
-        if not pattern or not category_id:
-            flash('Pattern and category are required.', 'danger')
+        fields, error = parse_rule_form(db)
+        if error:
+            flash(error, 'danger')
         else:
             db.execute(
                 '''INSERT INTO category_rules (user_id, category_id, pattern, match_field, is_regex, priority)
                    VALUES (?, ?, ?, ?, ?, ?)''',
-                (current_user.id, category_id, pattern, match_field, is_regex, priority)
+                (current_user.id, fields['category_id'], fields['pattern'], fields['match_field'],
+                 fields['is_regex'], fields['priority'])
             )
             db.commit()
             flash('Rule created successfully!', 'success')
@@ -5684,19 +5820,15 @@ def edit_rule(rule_id):
         return redirect(url_for('category_rules'))
 
     if request.method == 'POST':
-        pattern = request.form['pattern'].strip()
-        category_id = request.form['category_id']
-        match_field = request.form.get('match_field', 'description')
-        is_regex = 1 if request.form.get('is_regex') == 'on' else 0
-        priority = int(request.form.get('priority', 0))
-
-        if not pattern or not category_id:
-            flash('Pattern and category are required.', 'danger')
+        fields, error = parse_rule_form(db)
+        if error:
+            flash(error, 'danger')
         else:
             db.execute(
                 '''UPDATE category_rules SET pattern = ?, category_id = ?, match_field = ?, is_regex = ?, priority = ?
                    WHERE id = ? AND user_id = ?''',
-                (pattern, category_id, match_field, is_regex, priority, rule_id, current_user.id)
+                (fields['pattern'], fields['category_id'], fields['match_field'], fields['is_regex'],
+                 fields['priority'], rule_id, current_user.id)
             )
             db.commit()
             flash('Rule updated successfully!', 'success')
@@ -5806,9 +5938,12 @@ def api_auto_categorize_all():
         WHERE user_id = ? AND category_id IS NULL
     ''', (current_user.id,)).fetchall()
 
+    rules = load_category_rules(db, current_user.id)
     categorized_count = 0
     for trans in transactions:
-        category_id = auto_categorize_transaction(current_user.id, trans['description'] or '', trans['payee'] or '')
+        category_id = auto_categorize_transaction(
+            current_user.id, trans['description'] or '', trans['payee'] or '', rules=rules
+        )
         if category_id:
             db.execute('UPDATE transactions SET category_id = ? WHERE id = ?',
                       (category_id, trans['id']))
@@ -5817,306 +5952,6 @@ def api_auto_categorize_all():
     db.commit()
 
     return jsonify({'success': True, 'categorized': categorized_count})
-
-
-# Email Inbox routes
-@app.route('/email-inbox')
-@login_required
-def email_inbox():
-    db = get_db()
-
-    # Get or create inbox for user
-    inbox = db.execute('SELECT * FROM email_inboxes WHERE user_id = ?',
-                      (current_user.id,)).fetchone()
-
-    if not inbox:
-        # Create inbox for user
-        from email_processor import generate_inbox_email
-        email_domain = os.environ.get('EMAIL_DOMAIN', 'in.financetracker.app')
-        email_address, token = generate_inbox_email(current_user.id, email_domain)
-
-        db.execute('''
-            INSERT INTO email_inboxes (user_id, email_address, email_token)
-            VALUES (?, ?, ?)
-        ''', (current_user.id, email_address, token))
-        db.commit()
-
-        inbox = db.execute('SELECT * FROM email_inboxes WHERE user_id = ?',
-                          (current_user.id,)).fetchone()
-
-    # Get pending email transactions
-    pending_emails = db.execute('''
-        SELECT e.*, c.name as category_name, c.icon as category_icon
-        FROM email_transactions e
-        LEFT JOIN categories c ON e.suggested_category_id = c.id
-        WHERE e.user_id = ? AND e.status = 'pending'
-        ORDER BY e.received_at DESC
-    ''', (current_user.id,)).fetchall()
-
-    # Get recent processed emails
-    processed_emails = db.execute('''
-        SELECT e.*, c.name as category_name, t.amount as transaction_amount
-        FROM email_transactions e
-        LEFT JOIN categories c ON e.suggested_category_id = c.id
-        LEFT JOIN transactions t ON e.transaction_id = t.id
-        WHERE e.user_id = ? AND e.status != 'pending'
-        ORDER BY e.received_at DESC
-        LIMIT 20
-    ''', (current_user.id,)).fetchall()
-
-    accounts = db.execute('SELECT * FROM accounts WHERE user_id = ? ORDER BY name',
-                         (current_user.id,)).fetchall()
-    categories = db.execute('SELECT * FROM categories WHERE user_id = ? ORDER BY category_type, name',
-                           (current_user.id,)).fetchall()
-
-    return render_template('email_inbox.html',
-                         inbox=inbox,
-                         pending_emails=pending_emails,
-                         processed_emails=processed_emails,
-                         accounts=accounts,
-                         categories=categories)
-
-
-@app.route('/email-inbox/settings', methods=['POST'])
-@login_required
-def email_inbox_settings():
-    db = get_db()
-    default_account_id = request.form.get('default_account_id') or None
-    is_active = 1 if request.form.get('is_active') == 'on' else 0
-
-    db.execute('''
-        UPDATE email_inboxes SET default_account_id = ?, is_active = ?
-        WHERE user_id = ?
-    ''', (default_account_id, is_active, current_user.id))
-    db.commit()
-
-    flash('Email inbox settings updated.', 'success')
-    return redirect(url_for('email_inbox'))
-
-
-@app.route('/email-inbox/regenerate', methods=['POST'])
-@login_required
-def regenerate_inbox_email():
-    db = get_db()
-    from email_processor import generate_inbox_email
-
-    email_domain = os.environ.get('EMAIL_DOMAIN', 'in.financetracker.app')
-    email_address, token = generate_inbox_email(current_user.id, email_domain)
-
-    db.execute('''
-        UPDATE email_inboxes SET email_address = ?, email_token = ?
-        WHERE user_id = ?
-    ''', (email_address, token, current_user.id))
-    db.commit()
-
-    flash('New email address generated. Update your forwarding rules.', 'success')
-    return redirect(url_for('email_inbox'))
-
-
-# Email Webhook endpoint (receives forwarded emails)
-@app.route('/api/email/inbound', methods=['POST'])
-def email_inbound_webhook():
-    """
-    Webhook endpoint for receiving forwarded emails.
-    Supports SendGrid, Mailgun, and Postmark formats.
-    """
-    from email_processor import (
-        process_sendgrid_webhook, process_mailgun_webhook,
-        process_postmark_webhook, parse_email_content
-    )
-
-    db = get_db()
-
-    # Determine email provider and parse data
-    content_type = request.content_type or ''
-
-    if 'multipart/form-data' in content_type:
-        # SendGrid format
-        data = process_sendgrid_webhook(request.form.to_dict())
-    elif request.is_json:
-        json_data = request.get_json()
-        if 'FromFull' in json_data or 'TextBody' in json_data:
-            # Postmark format
-            data = process_postmark_webhook(json_data)
-        else:
-            # Mailgun or generic JSON
-            data = process_mailgun_webhook(json_data)
-    else:
-        # Try form data (Mailgun)
-        data = process_mailgun_webhook(request.form.to_dict())
-
-    # Extract recipient email to find inbox
-    to_email = data.get('to', '').lower()
-
-    # Handle multiple recipients
-    if ',' in to_email:
-        to_email = to_email.split(',')[0].strip()
-
-    # Extract just the email address if it includes name
-    email_match = re.search(r'[\w\.-]+@[\w\.-]+', to_email)
-    if email_match:
-        to_email = email_match.group(0)
-
-    # Find inbox
-    inbox = db.execute('SELECT * FROM email_inboxes WHERE email_address = ? AND is_active = 1',
-                      (to_email,)).fetchone()
-
-    if not inbox:
-        return jsonify({'error': 'Invalid inbox'}), 404
-
-    # Parse email content
-    parsed = parse_email_content(
-        data.get('subject', ''),
-        data.get('body', ''),
-        data.get('sender', ''),
-        data.get('html_body', '')
-    )
-
-    # Try to match category
-    suggested_category_id = None
-    if parsed.get('category_suggestion'):
-        category = db.execute(
-            'SELECT id FROM categories WHERE user_id = ? AND name LIKE ?',
-            (inbox['user_id'], f"%{parsed['category_suggestion']}%")
-        ).fetchone()
-        if category:
-            suggested_category_id = category['id']
-
-    # Also try auto-categorization rules
-    if not suggested_category_id and (parsed.get('vendor') or parsed.get('description')):
-        suggested_category_id = auto_categorize_transaction(
-            inbox['user_id'],
-            parsed.get('description', ''),
-            parsed.get('vendor', '')
-        )
-
-    # Store email transaction
-    db.execute('''
-        INSERT INTO email_transactions (
-            user_id, inbox_id, status, sender_email, subject, received_at,
-            parsed_vendor, parsed_amount, parsed_currency, parsed_date,
-            parsed_description, suggested_category_id, raw_body, attachments
-        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        inbox['user_id'],
-        inbox['id'],
-        data.get('sender', ''),
-        data.get('subject', ''),
-        datetime.now(),
-        parsed.get('vendor'),
-        parsed.get('amount'),
-        parsed.get('currency', 'EUR'),
-        parsed.get('date'),
-        parsed.get('description'),
-        suggested_category_id,
-        data.get('body', '')[:10000],  # Limit body size
-        json.dumps(data.get('attachments', [])) if data.get('attachments') else None
-    ))
-    db.commit()
-
-    return jsonify({'success': True, 'message': 'Email processed'})
-
-
-@app.route('/api/email/<int:email_id>/approve', methods=['POST'])
-@login_required
-def approve_email_transaction(email_id):
-    """Convert pending email to actual transaction."""
-    db = get_db()
-    data = request.get_json()
-
-    email_trans = db.execute(
-        'SELECT * FROM email_transactions WHERE id = ? AND user_id = ?',
-        (email_id, current_user.id)
-    ).fetchone()
-
-    if not email_trans:
-        return jsonify({'error': 'Email not found'}), 404
-
-    account_id = data.get('account_id')
-    category_id = data.get('category_id')
-    amount = data.get('amount', email_trans['parsed_amount'])
-    description = data.get('description', email_trans['parsed_description'])
-    date = data.get('date', email_trans['parsed_date'])
-
-    if not account_id:
-        # Use default account from inbox
-        inbox = db.execute('SELECT default_account_id FROM email_inboxes WHERE id = ?',
-                          (email_trans['inbox_id'],)).fetchone()
-        account_id = inbox['default_account_id'] if inbox else None
-
-    if not account_id:
-        return jsonify({'error': 'Account ID required'}), 400
-
-    if not amount:
-        return jsonify({'error': 'Amount required'}), 400
-
-    # Create transaction
-    cursor = db.execute('''
-        INSERT INTO transactions (user_id, account_id, category_id, transaction_type, amount, description, payee, date)
-        VALUES (?, ?, ?, 'expense', ?, ?, ?, ?)
-    ''', (current_user.id, account_id, category_id, amount, description, email_trans['parsed_vendor'], date))
-
-    transaction_id = cursor.lastrowid
-
-    # Update email transaction
-    db.execute('''
-        UPDATE email_transactions SET status = 'approved', transaction_id = ?
-        WHERE id = ?
-    ''', (transaction_id, email_id))
-
-    db.commit()
-
-    return jsonify({'success': True, 'transaction_id': transaction_id})
-
-
-@app.route('/api/email/<int:email_id>/reject', methods=['POST'])
-@login_required
-def reject_email_transaction(email_id):
-    """Mark email as rejected/ignored."""
-    db = get_db()
-
-    result = db.execute(
-        'UPDATE email_transactions SET status = ? WHERE id = ? AND user_id = ?',
-        ('rejected', email_id, current_user.id)
-    )
-    db.commit()
-
-    if result.rowcount == 0:
-        return jsonify({'error': 'Email not found'}), 404
-
-    return jsonify({'success': True})
-
-
-@app.route('/api/email/<int:email_id>/create-rule', methods=['POST'])
-@login_required
-def create_rule_from_email(email_id):
-    """Create categorization rule from email and approve it."""
-    db = get_db()
-    data = request.get_json()
-
-    email_trans = db.execute(
-        'SELECT * FROM email_transactions WHERE id = ? AND user_id = ?',
-        (email_id, current_user.id)
-    ).fetchone()
-
-    if not email_trans:
-        return jsonify({'error': 'Email not found'}), 404
-
-    pattern = data.get('pattern', email_trans['parsed_vendor'])
-    category_id = data.get('category_id')
-
-    if not pattern or not category_id:
-        return jsonify({'error': 'Pattern and category required'}), 400
-
-    # Create rule
-    db.execute('''
-        INSERT INTO category_rules (user_id, category_id, pattern, match_field, is_regex, priority)
-        VALUES (?, ?, ?, 'description', 0, 0)
-    ''', (current_user.id, category_id, pattern))
-
-    db.commit()
-
-    return jsonify({'success': True})
 
 
 # Budget routes
@@ -6192,7 +6027,7 @@ def add_budget():
 
     if request.method == 'POST':
         category_id = request.form['category_id']
-        amount = float(request.form['amount'])
+        amount = form_amount('amount', 'Amount')
 
         if not category_id or amount <= 0:
             flash('Please select a category and enter a valid amount.', 'danger')
@@ -6241,7 +6076,7 @@ def edit_budget(budget_id):
         return redirect(url_for('budgets'))
 
     if request.method == 'POST':
-        amount = float(request.form['amount'])
+        amount = form_amount('amount', 'Amount')
 
         if amount <= 0:
             flash('Please enter a valid amount.', 'danger')
@@ -6276,35 +6111,13 @@ def reports():
     base_currency = get_user_base_currency(current_user.id)
     ensure_daily_rates(db, base_currency)
 
-    # Get date range (default: last 6 months)
+    # Monthly chart covers the current month and the five before it.
     end_date = datetime.now()
-    start_date = datetime(end_date.year, end_date.month - 5 if end_date.month > 5 else end_date.month + 7, 1)
-    if end_date.month <= 5:
-        start_date = datetime(end_date.year - 1, start_date.month, 1)
-
-    monthly_rows = db.execute('''
-        SELECT strftime('%Y-%m', t.date) as month,
-               t.transaction_type,
-               t.amount,
-               a.currency as account_currency
-        FROM transactions t
-        JOIN accounts a ON t.account_id = a.id
-        WHERE t.user_id = ? AND t.date >= ?
-        ORDER BY month
-    ''', (current_user.id, start_date.strftime('%Y-%m-%d'))).fetchall()
-
-    monthly_map = {}
-    for row in monthly_rows:
-        month = row['month']
-        if month not in monthly_map:
-            monthly_map[month] = {'month': month, 'income': 0.0, 'expenses': 0.0}
-        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
-        if row['transaction_type'] == 'income':
-            monthly_map[month]['income'] += converted
-        elif row['transaction_type'] == 'expense':
-            monthly_map[month]['expenses'] += converted
-
-    monthly_data = [monthly_map[key] for key in sorted(monthly_map.keys())]
+    first_month = end_date.year * 12 + end_date.month - 1 - 5
+    start_date = datetime(first_month // 12, first_month % 12 + 1, 1)
+    monthly_data = monthly_income_expense(
+        db, current_user.id, base_currency, start_date=start_date.strftime('%Y-%m-%d')
+    )
 
     # Get selected month for category breakdown (default: current month)
     current_month = end_date.strftime('%Y-%m')
@@ -6318,27 +6131,7 @@ def reports():
         ORDER BY month DESC
     ''', (current_user.id,)).fetchall()
 
-    category_rows = db.execute('''
-        SELECT c.id, c.name, c.color, t.amount, a.currency as account_currency
-        FROM transactions t
-        JOIN categories c ON t.category_id = c.id
-        JOIN accounts a ON t.account_id = a.id
-        WHERE t.user_id = ? AND t.transaction_type = 'expense' AND strftime('%Y-%m', t.date) = ?
-    ''', (current_user.id, selected_month)).fetchall()
-
-    category_map = {}
-    for row in category_rows:
-        cat_id = row['id']
-        if cat_id not in category_map:
-            category_map[cat_id] = {'name': row['name'], 'color': row['color'], 'total': 0.0}
-        category_map[cat_id]['total'] += convert_amount(
-            db,
-            row['amount'],
-            row['account_currency'],
-            base_currency,
-        )
-
-    category_data = sorted(category_map.values(), key=lambda item: item['total'], reverse=True)
+    category_data = expense_totals_by_category(db, current_user.id, base_currency, selected_month)
 
     payee_rows = db.execute('''
         SELECT COALESCE(t.payee, '') as payee, t.amount, a.currency as account_currency
@@ -6374,72 +6167,23 @@ def reports():
                          base_currency=base_currency)
 
 
-# API endpoints for charts
-@app.route('/api/monthly-data')
-@login_required
-def api_monthly_data():
-    db = get_db()
-    months = request.args.get('months', 6, type=int)
-    base_currency = get_user_base_currency(current_user.id)
-    ensure_daily_rates(db, base_currency)
-
-    rows = db.execute('''
-        SELECT strftime('%Y-%m', t.date) as month,
-               t.transaction_type,
-               t.amount,
-               a.currency as account_currency
-        FROM transactions t
-        JOIN accounts a ON t.account_id = a.id
-        WHERE t.user_id = ?
-        ORDER BY month DESC
-    ''', (current_user.id,)).fetchall()
-
-    monthly_map = {}
-    for row in rows:
-        month = row['month']
-        if month not in monthly_map:
-            monthly_map[month] = {'month': month, 'income': 0.0, 'expenses': 0.0}
-        converted = convert_amount(db, row['amount'], row['account_currency'], base_currency)
-        if row['transaction_type'] == 'income':
-            monthly_map[month]['income'] += converted
-        elif row['transaction_type'] == 'expense':
-            monthly_map[month]['expenses'] += converted
-
-    ordered = [monthly_map[key] for key in sorted(monthly_map.keys(), reverse=True)[:months]]
-    ordered.reverse()
-    return jsonify(ordered)
+@app.errorhandler(413)
+def upload_too_large(_error):
+    flash('That file is too large (limit 25 MB).', 'danger')
+    return redirect(request.referrer or url_for('dashboard'))
 
 
-@app.route('/api/category-spending')
-@login_required
-def api_category_spending():
-    db = get_db()
-    month = request.args.get('month', datetime.now().strftime('%Y-%m'))
-    base_currency = get_user_base_currency(current_user.id)
-    ensure_daily_rates(db, base_currency)
-
-    rows = db.execute('''
-        SELECT c.id, c.name, c.color, t.amount, a.currency as account_currency
-        FROM transactions t
-        JOIN categories c ON t.category_id = c.id
-        JOIN accounts a ON t.account_id = a.id
-        WHERE t.user_id = ? AND t.transaction_type = 'expense' AND strftime('%Y-%m', t.date) = ?
-    ''', (current_user.id, month)).fetchall()
-
-    category_map = {}
-    for row in rows:
-        cat_id = row['id']
-        if cat_id not in category_map:
-            category_map[cat_id] = {'name': row['name'], 'color': row['color'], 'total': 0.0}
-        category_map[cat_id]['total'] += convert_amount(
-            db,
-            row['amount'],
-            row['account_currency'],
-            base_currency,
-        )
-
-    data = sorted(category_map.values(), key=lambda item: item['total'], reverse=True)
-    return jsonify(data)
+@app.before_request
+def reject_cross_site_writes():
+    """CSRF guard: a state-changing request must come from one of this site's own pages."""
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return None
+    source = request.headers.get('Origin') or request.headers.get('Referer')
+    if source is None:
+        return None  # non-browser clients (curl, tests) send neither header
+    if urlsplit(source).netloc != request.host:
+        abort(403)
+    return None
 
 
 # Initialize database on first request
@@ -6453,4 +6197,4 @@ def before_request():
 if __name__ == '__main__':
     with app.app_context():
         init_db()
-    app.run(debug=True, port=8000)
+    app.run(host='127.0.0.1', port=8000, debug=os.environ.get('FLASK_DEBUG') == '1')

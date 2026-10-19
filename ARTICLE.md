@@ -24,7 +24,6 @@ Using Claude Opus 4.5, we bootstrapped the entire web application in a weekend. 
 - **Keyboard-driven clearing** — the feature we missed most from Quicken. Press 1-9 to instantly assign a category, J/K to navigate, S to skip. You can blow through 50 uncategorized transactions in under a minute
 - **Budget tracking** with progress bars and over-budget warnings
 - **Reports** with Chart.js — monthly income vs. expenses, spending by category, top payees, savings rate
-- **Email inbox** — forward receipts to a unique address and they get parsed automatically
 
 The whole thing runs on a single SQLite file. No Postgres, no Redis, no external dependencies. `pip install`, `python app.py`, done.
 

@@ -131,4 +131,17 @@
         </table>
     </div>
 </div>
+
+<div class="card mt-4">
+    <div class="card-header"><i class="bi bi-database"></i> Backup</div>
+    <div class="card-body">
+        <p class="mb-2">
+            Download a complete copy of your data as a SQLite file. To restore it, stop the app
+            and replace <code>finance.db</code> with the downloaded file.
+        </p>
+        <a class="btn btn-success" href="{{ url_for('export_database') }}">
+            <i class="bi bi-database-down"></i> Download database backup
+        </a>
+    </div>
+</div>
 {% endblock %}

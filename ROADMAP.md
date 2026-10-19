@@ -18,6 +18,20 @@ reports.
 **Touch points:** `transactions` schema, add/edit transaction form, balance aggregation
 (`dashboard`, accounts list), import flow (already detects transfer-like categories).
 
+**Audit notes (2026-10):**
+- `is_transfer_like_category` matches the substring "transfer", so Revolut's generic
+  "transfers" category (also used for payments to *other people*) forces real spending to
+  type transfer and out of expenses/budgets (`upsert_bank_transactions`).
+- Moves between own accounts that are *not* detected inflate income and expenses: Revolut
+  TOPUP rows (income), Trade Republic `TRANSFER_INBOUND`/`TRANSFER_INSTANT_INBOUND`
+  (`TRADE_REPUBLIC_INCOME_TYPES`), B100 outgoing transfers (expense).
+- Refunds are booked as income (Revolut CARD_REFUND/REFUND/CHARGEBACK_REVERSAL, negative
+  Iberia/Edenred charges). They should reduce spending in their category instead, so budgets
+  and reports net them out. Rows imported before the Edenred refund-sign fix keep their old
+  type (re-imports no longer overwrite the type).
+- Import category matching ignores the transaction type, so income rows can get expense
+  categories.
+
 ---
 
 ## 2. Opening / initial balances are ignored  `TODO`
@@ -61,6 +75,18 @@ From `TODO.md`, still open:
 
 **Touch points:** `investment_holdings`, `investment_operations`, import flow, price sync,
 investments dashboard.
+
+**Audit notes (2026-10):**
+- Trade Republic: only BUY becomes an investment operation; SELL and DIVIDEND rows fall
+  through to income/expense, holdings never decrease, and the `fee`/`tax` columns are ignored.
+- Mintos: withdrawals and other unknown transaction types are skipped by `parse_mintos_xlsx`,
+  so value is overstated and cost basis never decreases. The current Mintos holding's stored
+  valuation returns are off by roughly the withdrawn amount (totals and YTD are now derived
+  from value − cost and valuations, so they are not affected).
+- YTD for market-priced holdings only counts dividends + realized gains (price movement since
+  1 January is not captured without year-start snapshots).
+- Historical FX: one current rate per currency pair, so old months and cost bases are
+  converted at today's rate.
 
 ---
 

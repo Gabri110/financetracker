@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from '_macros.html' import category_optgroups %}
 
 {% block title %}{{ 'Edit Rule' if rule else 'Add Rule' }} - Personal Finance{% endblock %}
 
@@ -26,30 +27,7 @@
                         <label for="category_id" class="form-label">Category *</label>
                         <select class="form-select" id="category_id" name="category_id" required>
                             <option value="">Select category...</option>
-                            <optgroup label="Expenses">
-                                {% for category in categories if category.category_type == 'expense' %}
-                                <option value="{{ category.id }}"
-                                        {% if rule and rule.category_id == category.id %}selected{% endif %}>
-                                    {{ category.icon }} {{ category.name }}
-                                </option>
-                                {% endfor %}
-                            </optgroup>
-                            <optgroup label="Income">
-                                {% for category in categories if category.category_type == 'income' %}
-                                <option value="{{ category.id }}"
-                                        {% if rule and rule.category_id == category.id %}selected{% endif %}>
-                                    {{ category.icon }} {{ category.name }}
-                                </option>
-                                {% endfor %}
-                            </optgroup>
-                            <optgroup label="Transfers">
-                                {% for category in categories if category.category_type == 'transfer' %}
-                                <option value="{{ category.id }}"
-                                        {% if rule and rule.category_id == category.id %}selected{% endif %}>
-                                    {{ category.icon }} {{ category.name }}
-                                </option>
-                                {% endfor %}
-                            </optgroup>
+                            {{ category_optgroups(categories, rule.category_id if rule else None) }}
                         </select>
                     </div>
 

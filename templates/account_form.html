@@ -47,13 +47,11 @@
                     <div class="mb-4">
                         <label for="currency" class="form-label">Currency</label>
                         <select class="form-select" id="currency" name="currency">
-                            <option value="USD" {% if not account or account.currency == 'USD' %}selected{% endif %}>USD - US Dollar</option>
-                            <option value="EUR" {% if account and account.currency == 'EUR' %}selected{% endif %}>EUR - Euro</option>
-                            <option value="GBP" {% if account and account.currency == 'GBP' %}selected{% endif %}>GBP - British Pound</option>
-                            <option value="CAD" {% if account and account.currency == 'CAD' %}selected{% endif %}>CAD - Canadian Dollar</option>
-                            <option value="AUD" {% if account and account.currency == 'AUD' %}selected{% endif %}>AUD - Australian Dollar</option>
-                            <option value="JPY" {% if account and account.currency == 'JPY' %}selected{% endif %}>JPY - Japanese Yen</option>
-                            <option value="MXN" {% if account and account.currency == 'MXN' %}selected{% endif %}>MXN - Mexican Peso</option>
+                            {% set selected_currency = account.currency if account and account.currency else user_base_currency() %}
+                            {% set currency_options = supported_currencies if selected_currency in supported_currencies else (supported_currencies + [selected_currency]) %}
+                            {% for code in currency_options %}
+                            <option value="{{ code }}" {% if code == selected_currency %}selected{% endif %}>{{ code }}</option>
+                            {% endfor %}
                         </select>
                     </div>
 

@@ -1,0 +1,14 @@
+{# Shared form fragments. Import with: {% from '_macros.html' import category_optgroups %} #}
+
+{% set CATEGORY_GROUP_LABELS = {'income': 'Income', 'expense': 'Expenses', 'transfer': 'Transfers'} %}
+
+{# <optgroup>s of categories by type, in the given order, marking selected_id as selected. #}
+{% macro category_optgroups(categories, selected_id=None, types=('expense', 'income', 'transfer')) %}
+{% for category_type in types %}
+<optgroup label="{{ CATEGORY_GROUP_LABELS[category_type] }}">
+    {% for category in categories if category.category_type == category_type %}
+    <option value="{{ category.id }}" {% if selected_id == category.id %}selected{% endif %}>{{ category.icon }} {{ category.name }}</option>
+    {% endfor %}
+</optgroup>
+{% endfor %}
+{% endmacro %}

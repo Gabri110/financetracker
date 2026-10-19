@@ -83,7 +83,7 @@
     "currency": "Moneda",
     "balance": "Saldo",
     "noAccounts": "No hay cuentas a\u00fan. Agrega una para comenzar.",
-    "deleteConfirm": "\u00bfEliminar esta cuenta?",
+    "deleteConfirm": "\u00bfEliminar esta cuenta y todas sus transacciones?",
     "accountUpdated": "Cuenta actualizada.",
     "accountAdded": "Cuenta agregada.",
     "types": {
@@ -118,7 +118,7 @@
     "newCategory": "Nueva Categor\u00eda",
     "icon": "\u00cdcono",
     "color": "Color",
-    "deleteConfirm": "\u00bfEliminar esta categor\u00eda?",
+    "deleteConfirm": "\u00bfEliminar esta categor\u00eda? Sus transacciones quedar\u00e1n sin categor\u00eda y se borrar\u00e1n sus reglas y presupuestos.",
     "categoryUpdated": "Categor\u00eda actualizada.",
     "categoryAdded": "Categor\u00eda agregada."
   },

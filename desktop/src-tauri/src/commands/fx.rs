@@ -3,8 +3,14 @@ use regex::Regex;
 use rusqlite::params;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ECB_DAILY_URL: &str = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml";
+const ECB_TIMEOUT: Duration = Duration::from_secs(8);
+// When offline, retry the ECB fetch at most once an hour.
+const SYNC_RETRY_SECS: u64 = 3600;
+static LAST_SYNC_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize)]
 pub struct ExchangeRate {
@@ -37,7 +43,13 @@ pub fn get_base_currency_from_conn(conn: &rusqlite::Connection) -> Result<String
 }
 
 fn fetch_ecb_rates_against_eur() -> Result<HashMap<String, f64>, String> {
-    let body = reqwest::blocking::get(ECB_DAILY_URL)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(ECB_TIMEOUT)
+        .build()
+        .map_err(|e| format!("HTTP client init failed: {e}"))?;
+    let body = client
+        .get(ECB_DAILY_URL)
+        .send()
         .map_err(|e| format!("ECB request failed: {e}"))?
         .text()
         .map_err(|e| format!("ECB body read failed: {e}"))?;
@@ -104,10 +116,11 @@ fn sync_ecb_rates_for_base_conn(conn: &rusqlite::Connection, base_currency: &str
 pub fn ensure_daily_rates_from_conn(conn: &rusqlite::Connection) -> Result<(), String> {
     let base = get_base_currency_from_conn(conn)?;
 
+    // updated_at is written with datetime('now') (UTC), so compare UTC dates.
     let has_today = conn
         .query_row(
             "SELECT 1 FROM exchange_rates
-             WHERE to_currency = ?1 AND date(updated_at) = date('now', 'localtime')
+             WHERE to_currency = ?1 AND date(updated_at) = date('now')
              LIMIT 1",
             params![base],
             |_| Ok(()),
@@ -115,10 +128,28 @@ pub fn ensure_daily_rates_from_conn(conn: &rusqlite::Connection) -> Result<(), S
         .is_ok();
 
     if !has_today {
-        let _ = sync_ecb_rates_for_base_conn(conn, &base);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(LAST_SYNC_ATTEMPT.load(Ordering::Relaxed)) >= SYNC_RETRY_SECS {
+            LAST_SYNC_ATTEMPT.store(now, Ordering::Relaxed);
+            let _ = sync_ecb_rates_for_base_conn(conn, &base);
+        }
     }
 
     Ok(())
+}
+
+/// Refresh today's ECB rates in the background, on a separate connection, so the
+/// network call never blocks the UI thread or holds the app's DB lock.
+pub fn spawn_daily_rate_sync(path: String) {
+    std::thread::spawn(move || {
+        if let Ok(conn) = rusqlite::Connection::open(&path) {
+            let _ = conn.busy_timeout(Duration::from_secs(5));
+            let _ = ensure_daily_rates_from_conn(&conn);
+        }
+    });
 }
 
 pub fn convert_amount_from_conn(

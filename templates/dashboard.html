@@ -164,10 +164,10 @@ const ctx = document.getElementById('categoryChart').getContext('2d');
 new Chart(ctx, {
     type: 'doughnut',
     data: {
-        labels: [{% for cat in category_spending %}'{{ cat.icon }} {{ cat.name }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+        labels: [{% for cat in category_spending %}{{ ((cat.icon or '') ~ ' ' ~ cat.name)|tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
         datasets: [{
             data: [{% for cat in category_spending %}{{ cat.total }}{% if not loop.last %}, {% endif %}{% endfor %}],
-            backgroundColor: [{% for cat in category_spending %}'{{ cat.color }}'{% if not loop.last %}, {% endif %}{% endfor %}],
+            backgroundColor: [{% for cat in category_spending %}{{ cat.color|tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
             borderWidth: 0
         }]
     },

@@ -2,10 +2,9 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { getBudgets, addBudget, updateBudget, deleteBudget, getCategories } from "../api/tauri";
 import Alert from "../components/Alert";
+import { fmt } from "../format";
 
 const today = () => new Date().toISOString().slice(0, 10);
-const fmt = (n, currency = "USD") =>
-  new Intl.NumberFormat("en-US", { style: "currency", currency }).format(n);
 const empty = { category_id: "", amount: "", period: "monthly", start_date: today() };
 
 export default function Budgets() {
