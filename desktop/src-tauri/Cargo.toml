@@ -25,6 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 base64 = "0.22"
-zip = "2"
+# calamine 0.26 doesn't compile against zip >= 2.3 (ZipFile became generic over its reader).
+zip = "~2.2"
 calamine = "0.26"
 rust_xlsxwriter = "0.81"
