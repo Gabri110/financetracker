@@ -299,7 +299,7 @@ fn csv_to_rows(csv_content: &str) -> Result<Vec<Vec<String>>, String> {
 }
 
 fn write_sheet_from_csv(workbook: &mut Workbook, sheet_name: &str, csv_content: &str) -> Result<(), String> {
-    let mut worksheet = workbook.add_worksheet();
+    let worksheet = workbook.add_worksheet();
     worksheet.set_name(sheet_name).map_err(|e| e.to_string())?;
 
     let mut reader = ReaderBuilder::new()
@@ -879,7 +879,7 @@ pub fn export_full_backup_xlsx_base64(state: tauri::State<AppState>) -> Result<S
     let mut workbook = Workbook::new();
 
     {
-        let mut metadata = workbook.add_worksheet();
+        let metadata = workbook.add_worksheet();
         metadata.set_name("Metadata").map_err(|e| e.to_string())?;
         metadata.write_string(0, 0, "KEY").map_err(|e| e.to_string())?;
         metadata.write_string(0, 1, "VALUE").map_err(|e| e.to_string())?;

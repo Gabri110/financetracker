@@ -266,18 +266,20 @@ pub fn get_exchange_rates(
         )
         .map_err(|e| e.to_string())?;
 
-    stmt.query_map(params![target], |row| {
-        Ok(ExchangeRate {
-            from_currency: row.get(0)?,
-            to_currency: row.get(1)?,
-            rate: row.get(2)?,
-            provider: row.get(3)?,
-            updated_at: row.get(4)?,
+    let rates = stmt
+        .query_map(params![target], |row| {
+            Ok(ExchangeRate {
+                from_currency: row.get(0)?,
+                to_currency: row.get(1)?,
+                rate: row.get(2)?,
+                provider: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
         })
-    })
-    .map_err(|e| e.to_string())?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string());
+    rates
 }
 
 #[tauri::command]
